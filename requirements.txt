@@ -8,3 +8,9 @@ flask>=2.0.1
 werkzeug>=2.0.0
 asyncio>=3.4.3
 configparser>=5.0.0
+
+
+# 新增依赖
+aiohttp>=3.8.0
+aiohttp-socks>=0.7.0
+ipaddress>=1.0.0
