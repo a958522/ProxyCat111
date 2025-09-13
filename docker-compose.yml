@@ -1,13 +1,21 @@
-version: '3'
+version: '3.8'
+
 services:
   proxycat:
     build: .
-    environment:
-      - TZ=Asia/Shanghai
+    container_name: proxycat
     ports:
-      - "1080:1080"
-      - "5000:5000"
+      - "1081:1080"  # SOCKS5代理端口
+      - "5001:5000"  # Web管理界面端口
     volumes:
       - ./config:/app/config
+      - ./logs:/app/logs
+    environment:
+      - TZ=Asia/Shanghai
     restart: unless-stopped
-    network_mode: "bridge"
+    networks:
+      - proxycat_network
+
+networks:
+  proxycat_network:
+    driver: bridge
