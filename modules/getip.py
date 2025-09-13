@@ -17,7 +17,7 @@ def load_config():
     config = {
         'language': 'cn',
         'getip_url': '',
-        'buy_url_template': 'https://api.s5proxies.com/api2.php?do=buy&key=68bdb7530a84a2025090711481968bdb7530a85a&id=',
+        'buy_url_template': '',
         'proxy_username': '',
         'proxy_password': ''
     }
