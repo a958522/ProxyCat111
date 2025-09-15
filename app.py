@@ -1,634 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-ProxyCat 最终版本 - 解决事件循环问题 + 黑名单本地缓存功能
-"""
-
-import asyncio
-import socket
-import struct
-import threading
-import logging
-import os
-import sys
-import json
-import time
-import signal
-import importlib.util
-import subprocess
-from datetime import datetime
-from flask import Flask, request, jsonify, render_template_string
-from concurrent.futures import ThreadPoolExecutor
-
-# 添加当前目录到Python路径
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, current_dir)
-
-# 创建 Flask 应用
-app = Flask(__name__)
-
-# 全局变量
-current_proxy = None
-socks_server = None
-country_monitor = None
-main_loop = None  # 主事件循环
-executor = ThreadPoolExecutor(max_workers=4)  # 线程池
-
-proxy_stats = {
-    'current_proxy': None,
-    'current_country': None,
-    'total_checks': 0,
-    'proxy_switches': 0,
-    'country_changes': 0,
-    'blacklist_hits': 0,
-    'blacklist_size': 0,
-    'target_country': 'US',
-    'mode': 'country',
-    'language': 'cn',
-    'use_getip': True,
-    'port': 1080,
-    'web_port': 5000,
-    'connections_count': 0,
-    'bytes_transferred': 0
-}
-
-def load_simple_config():
-    """加载简化配置"""
-    config_path = os.path.join(current_dir, 'config', 'config.ini')
-    config = {
-        'mode': 'country',
-        'target_country': 'US',
-        'language': 'cn',
-        'use_getip': 'True',
-        'port': '1080',
-        'web_port': '5000',
-        'getip_url': '',
-        'buy_url_template': '',
-        'proxy_username': '',
-        'proxy_password': '',
-        'country_check_interval': '60'
-    }
-    
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#') and '=' in line:
-                        key, value = line.split('=', 1)
-                        key = key.strip()
-                        value = value.strip()
-                        config[key] = value
-        except Exception as e:
-            logging.error(f"读取配置文件失败: {e}")
-    
-    return config
-
-def safe_import_getip():
-    """安全导入 getip 模块"""
-    try:
-        getip_path = os.path.join(current_dir, 'modules', 'getip.py')
-        if not os.path.exists(getip_path):
-            logging.error(f"getip.py 文件不存在: {getip_path}")
-            return None
-        
-        # 动态导入 modules.modules（如果存在）
-        modules_path = os.path.join(current_dir, 'modules', 'modules.py')
-        if os.path.exists(modules_path):
-            modules_spec = importlib.util.spec_from_file_location("modules", modules_path)
-            modules_module = importlib.util.module_from_spec(modules_spec)
-            sys.modules['modules.modules'] = modules_module
-            modules_spec.loader.exec_module(modules_module)
-        
-        # 动态导入 getip
-        spec = importlib.util.spec_from_file_location("getip", getip_path)
-        getip_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(getip_module)
-        
-        logging.info("✅ getip 模块加载成功")
-        return getip_module.newip
-        
-    except Exception as e:
-        logging.error(f"❌ getip 模块加载失败: {e}")
-        return None
-
-def run_in_executor(func, *args):
-    """在线程池中运行同步函数"""
-    return executor.submit(func, *args)
-
-def schedule_coroutine(coro):
-    """在主事件循环中调度协程"""
-    if main_loop and main_loop.is_running():
-        future = asyncio.run_coroutine_threadsafe(coro, main_loop)
-        return future
-    else:
-        logging.error("❌ 主事件循环不可用")
-        return None
-
-class CountryMonitor:
-    """自动国家检测和代理切换系统"""
-    
-    def __init__(self, target_country='US', check_interval=60):
-        self.target_country = target_country
-        self.check_interval = check_interval
-        self.is_monitoring = False
-        self.last_check_time = 0
-        self.last_country = None
-        self.consecutive_failures = 0
-        self.max_failures = 3
-        self.monitor_task = None
-        
-    async def start_monitoring(self):
-        """启动自动监控"""
-        if self.is_monitoring:
-            logging.warning("⚠️ 国家监控已在运行中")
-            return
-            
-        self.is_monitoring = True
-        logging.info(f"🌍 启动自动国家监控 - 目标国家: {self.target_country}, 检测间隔: {self.check_interval}秒")
-        
-        # 创建监控任务
-        self.monitor_task = asyncio.create_task(self._monitoring_loop())
-        
-    async def _monitoring_loop(self):
-        """监控循环"""
-        while self.is_monitoring:
-            try:
-                await self.check_and_switch_if_needed()
-                await asyncio.sleep(self.check_interval)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logging.error(f"❌ 监控循环异常: {e}")
-                await asyncio.sleep(10)
-    
-    def stop_monitoring(self):
-        """停止监控"""
-        self.is_monitoring = False
-        if self.monitor_task:
-            self.monitor_task.cancel()
-        logging.info("🛑 自动国家监控已停止")
-    
-    async def check_and_switch_if_needed(self):
-        """检查当前代理国家，必要时切换"""
-        global current_proxy, proxy_stats
-        
-        if not current_proxy:
-            logging.info("🔄 当前无代理，尝试获取新代理...")
-            await self.switch_proxy("无代理")
-            return
-        
-        try:
-            country = await self.detect_proxy_country(current_proxy)
-            
-            if country:
-                self.consecutive_failures = 0
-                proxy_stats['current_country'] = country
-                proxy_stats['total_checks'] += 1
-                self.last_check_time = time.time()
-                
-                if self.last_country != country:
-                    if self.last_country is not None:
-                        proxy_stats['country_changes'] += 1
-                        logging.info(f"🌍 检测到国家变化: {self.last_country} -> {country}")
-                    else:
-                        logging.info(f"🌍 首次检测到代理国家: {country}")
-                    
-                    self.last_country = country
-                
-                if country != self.target_country:
-                    logging.warning(f"⚠️ 当前国家 {country} 不符合目标国家 {self.target_country}")
-                    await self.switch_proxy(f"国家不匹配 ({country} != {self.target_country})")
-                else:
-                    logging.info(f"✅ 代理国家检查通过: {country}")
-            
-            else:
-                self.consecutive_failures += 1
-                logging.error(f"❌ 代理国家检测失败 (连续失败 {self.consecutive_failures}/{self.max_failures})")
-                
-                if self.consecutive_failures >= self.max_failures:
-                    logging.error("❌ 连续检测失败次数过多，切换代理")
-                    await self.switch_proxy("连续检测失败")
-                    self.consecutive_failures = 0
-        
-        except Exception as e:
-            logging.error(f"❌ 国家检测过程异常: {e}")
-            self.consecutive_failures += 1
-    
-    async def detect_proxy_country(self, proxy_url):
-        """检测代理的真实出口国家"""
-        try:
-            proxy_for_curl = proxy_url
-            if proxy_for_curl.startswith('socks5://'):
-                proxy_for_curl = proxy_for_curl[9:]
-            
-            cmd = [
-                'curl', '-s', '--connect-timeout', '10', '--max-time', '15',
-                '-x', f'socks5://{proxy_for_curl}',
-                'https://ipinfo.io?token=2247bca03780c6'
-            ]
-            
-            # 在线程池中运行subprocess
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                executor, 
-                lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-            )
-            
-            if result.returncode == 0:
-                try:
-                    data = json.loads(result.stdout)
-                    country = data.get('country')
-                    ip = data.get('ip')
-                    
-                    if country and ip:
-                        logging.debug(f"🌐 检测到代理信息: IP={ip}, 国家={country}")
-                        return country
-                    else:
-                        logging.warning("⚠️ IP检测响应缺少必要字段")
-                        return None
-                        
-                except json.JSONDecodeError:
-                    logging.error("❌ IP检测服务返回无效JSON")
-                    return None
-            else:
-                error_msg = result.stderr.strip() if result.stderr else "未知错误"
-                logging.error(f"❌ curl 检测失败: {error_msg}")
-                return None
-                
-        except Exception as e:
-            logging.error(f"❌ 代理国家检测异常: {e}")
-            return None
-    
-    async def switch_proxy(self, reason):
-        """切换到新代理"""
-        global current_proxy, proxy_stats
-        
-        logging.info(f"🔄 开始切换代理，原因: {reason}")
-        
-        try:
-            newip_func = safe_import_getip()
-            if not newip_func:
-                logging.error("❌ getip 模块不可用，无法切换代理")
-                return False
-            
-            max_attempts = 5
-            for attempt in range(max_attempts):
-                try:
-                    # 在线程池中获取新代理
-                    loop = asyncio.get_event_loop()
-                    new_proxy = await loop.run_in_executor(executor, newip_func)
-                    
-                    if new_proxy:
-                        logging.info(f"🧪 验证新代理国家 (尝试 {attempt + 1}/{max_attempts})")
-                        country = await self.detect_proxy_country(new_proxy)
-                        
-                        if country == self.target_country:
-                            old_proxy = current_proxy
-                            current_proxy = new_proxy
-                            proxy_stats['current_proxy'] = new_proxy
-                            proxy_stats['current_country'] = country
-                            proxy_stats['proxy_switches'] += 1
-                            self.last_country = country
-                            
-                            logging.info(f"✅ 代理切换成功: {country} ({new_proxy.split('@')[-1] if '@' in new_proxy else new_proxy})")
-                            return True
-                        
-                        elif country:
-                            logging.warning(f"⚠️ 新代理国家 {country} 不符合目标 {self.target_country}，重试...")
-                        else:
-                            logging.warning("⚠️ 新代理国家检测失败，重试...")
-                    
-                    else:
-                        logging.error("❌ 获取新代理返回空值")
-                    
-                    if attempt < max_attempts - 1:
-                        await asyncio.sleep(2)
-                        
-                except Exception as e:
-                    logging.error(f"❌ 获取新代理失败 (尝试 {attempt + 1}): {e}")
-                    if attempt < max_attempts - 1:
-                        await asyncio.sleep(2)
-            
-            logging.error(f"❌ 在 {max_attempts} 次尝试后仍无法获取符合要求的代理")
-            return False
-            
-        except Exception as e:
-            logging.error(f"❌ 代理切换过程异常: {e}")
-            return False
-    
-    def get_stats(self):
-        """获取监控统计信息"""
-        return {
-            'is_monitoring': self.is_monitoring,
-            'target_country': self.target_country,
-            'check_interval': self.check_interval,
-            'last_check_time': datetime.fromtimestamp(self.last_check_time).isoformat() if self.last_check_time else None,
-            'last_country': self.last_country,
-            'consecutive_failures': self.consecutive_failures
-        }
-
-class SOCKS5Server:
-    """完整的 SOCKS5 代理服务器"""
-    
-    def __init__(self, host='0.0.0.0', port=1080):
-        self.host = host
-        self.port = port
-        self.running = False
-        self.server = None
-        
-    async def start(self):
-        """启动 SOCKS5 服务器"""
-        try:
-            self.running = True
-            self.server = await asyncio.start_server(
-                self.handle_client, self.host, self.port
-            )
-            
-            logging.info(f"🚀 SOCKS5 服务器已启动: {self.host}:{self.port}")
-            
-            async with self.server:
-                await self.server.serve_forever()
-                
-        except Exception as e:
-            logging.error(f"❌ SOCKS5 服务器启动失败: {e}")
-            self.running = False
-    
-    async def stop(self):
-        """停止 SOCKS5 服务器"""
-        self.running = False
-        if self.server:
-            self.server.close()
-            await self.server.wait_closed()
-            logging.info("🛑 SOCKS5 服务器已停止")
-    
-    async def handle_client(self, reader, writer):
-        """处理客户端连接"""
-        client_addr = writer.get_extra_info('peername')
-        logging.info(f"📱 新客户端连接: {client_addr}")
-        proxy_stats['connections_count'] += 1
-        
-        try:
-            if not await self.socks5_handshake(reader, writer):
-                return
-            
-            target_host, target_port = await self.socks5_connect_request(reader, writer)
-            if not target_host:
-                return
-            
-            await self.proxy_connection(target_host, target_port, reader, writer)
-            
-        except Exception as e:
-            logging.error(f"❌ 处理客户端连接失败 {client_addr}: {e}")
-        finally:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except:
-                pass
-            logging.debug(f"🔌 客户端连接关闭: {client_addr}")
-    
-    async def socks5_handshake(self, reader, writer):
-        """SOCKS5 握手"""
-        try:
-            data = await asyncio.wait_for(reader.read(1024), timeout=10)
-            
-            if len(data) < 3 or data[0] != 0x05:
-                logging.warning("❌ 无效的 SOCKS5 握手")
-                return False
-            
-            writer.write(b'\x05\x00')
-            await writer.drain()
-            
-            return True
-            
-        except Exception as e:
-            logging.error(f"❌ SOCKS5 握手失败: {e}")
-            return False
-    
-    async def socks5_connect_request(self, reader, writer):
-        """处理 SOCKS5 连接请求"""
-        try:
-            data = await asyncio.wait_for(reader.read(1024), timeout=10)
-            
-            if len(data) < 10 or data[0] != 0x05:
-                logging.warning("❌ 无效的 SOCKS5 连接请求")
-                return None, None
-            
-            cmd = data[1]
-            atyp = data[3]
-            
-            if cmd != 0x01:
-                writer.write(b'\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00')
-                await writer.drain()
-                return None, None
-            
-            if atyp == 0x01:  # IPv4
-                target_host = socket.inet_ntoa(data[4:8])
-                target_port = struct.unpack('>H', data[8:10])[0]
-            elif atyp == 0x03:  # 域名
-                addr_len = data[4]
-                target_host = data[5:5+addr_len].decode('utf-8')
-                target_port = struct.unpack('>H', data[5+addr_len:7+addr_len])[0]
-            else:
-                logging.warning(f"❌ 不支持的地址类型: {atyp}")
-                writer.write(b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00')
-                await writer.drain()
-                return None, None
-            
-            logging.info(f"🎯 连接目标: {target_host}:{target_port}")
-            return target_host, target_port
-            
-        except Exception as e:
-            logging.error(f"❌ 解析连接请求失败: {e}")
-            return None, None
-    
-    async def proxy_connection(self, target_host, target_port, client_reader, client_writer):
-        """通过上游代理连接目标"""
-        proxy_url = self.get_current_proxy()
-        
-        if not proxy_url:
-            logging.error("❌ 没有可用的代理")
-            client_writer.write(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
-            await client_writer.drain()
-            return
-        
-        try:
-            proxy_info = self.parse_proxy_url(proxy_url)
-            if not proxy_info:
-                raise Exception("无效的代理URL")
-            
-            proxy_reader, proxy_writer = await asyncio.wait_for(
-                asyncio.open_connection(proxy_info['host'], proxy_info['port']),
-                timeout=10
-            )
-            
-            success = await self.upstream_socks5_handshake(
-                proxy_reader, proxy_writer, proxy_info
-            )
-            
-            if not success:
-                raise Exception("上游代理握手失败")
-            
-            success = await self.upstream_connect_request(
-                proxy_reader, proxy_writer, target_host, target_port
-            )
-            
-            if not success:
-                raise Exception("上游代理连接目标失败")
-            
-            client_writer.write(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
-            await client_writer.drain()
-            
-            logging.info(f"✅ 代理连接建立: {target_host}:{target_port}")
-            
-            await asyncio.gather(
-                self.pipe_data(client_reader, proxy_writer, "客户端->代理"),
-                self.pipe_data(proxy_reader, client_writer, "代理->客户端"),
-                return_exceptions=True
-            )
-            
-        except Exception as e:
-            logging.error(f"❌ 代理连接失败: {e}")
-            try:
-                client_writer.write(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
-                await client_writer.drain()
-            except:
-                pass
-    
-    def parse_proxy_url(self, proxy_url):
-        """解析代理URL"""
-        try:
-            if '://' in proxy_url:
-                proxy_url = proxy_url.split('://', 1)[1]
-            
-            if '@' in proxy_url:
-                auth_part, addr_part = proxy_url.split('@', 1)
-                username, password = auth_part.split(':', 1)
-                host, port = addr_part.split(':', 1)
-            else:
-                username = password = None
-                host, port = proxy_url.split(':', 1)
-            
-            return {
-                'host': host,
-                'port': int(port),
-                'username': username,
-                'password': password
-            }
-            
-        except Exception as e:
-            logging.error(f"❌ 解析代理URL失败: {e}")
-            return None
-    
-    async def upstream_socks5_handshake(self, reader, writer, proxy_info):
-        """与上游代理进行 SOCKS5 握手"""
-        try:
-            if proxy_info['username'] and proxy_info['password']:
-                writer.write(b'\x05\x02\x00\x02')
-            else:
-                writer.write(b'\x05\x01\x00')
-            
-            await writer.drain()
-            
-            response = await asyncio.wait_for(reader.read(2), timeout=10)
-            
-            if len(response) != 2 or response[0] != 0x05:
-                return False
-            
-            if response[1] == 0x02:
-                if not proxy_info['username'] or not proxy_info['password']:
-                    return False
-                
-                username = proxy_info['username'].encode('utf-8')
-                password = proxy_info['password'].encode('utf-8')
-                auth_data = struct.pack('B', len(username)) + username + struct.pack('B', len(password)) + password
-                writer.write(b'\x01' + auth_data)
-                await writer.drain()
-                
-                auth_response = await asyncio.wait_for(reader.read(2), timeout=10)
-                if auth_response != b'\x01\x00':
-                    return False
-            
-            elif response[1] != 0x00:
-                return False
-            
-            return True
-            
-        except Exception as e:
-            logging.error(f"❌ 上游代理握手失败: {e}")
-            return False
-    
-    async def upstream_connect_request(self, reader, writer, target_host, target_port):
-        """请求上游代理连接目标"""
-        try:
-            if target_host.replace('.', '').isdigit():
-                addr_data = b'\x01' + socket.inet_aton(target_host)
-            else:
-                target_host_bytes = target_host.encode('utf-8')
-                addr_data = b'\x03' + struct.pack('B', len(target_host_bytes)) + target_host_bytes
-            
-            request_data = b'\x05\x01\x00' + addr_data + struct.pack('>H', target_port)
-            writer.write(request_data)
-            await writer.drain()
-            
-            response = await asyncio.wait_for(reader.read(1024), timeout=15)
-            
-            if len(response) < 2 or response[0] != 0x05 or response[1] != 0x00:
-                logging.error(f"❌ 上游代理连接失败，响应码: {response[1] if len(response) > 1 else 'unknown'}")
-                return False
-            
-            return True
-            
-        except Exception as e:
-            logging.error(f"❌ 上游代理连接请求失败: {e}")
-            return False
-    
-    async def pipe_data(self, reader, writer, direction):
-        """数据转发"""
-        try:
-            while True:
-                data = await reader.read(8192)
-                if not data:
-                    break
-                
-                writer.write(data)
-                await writer.drain()
-                
-                proxy_stats['bytes_transferred'] += len(data)
-                
-        except Exception as e:
-            logging.debug(f"🔄 数据转发结束 ({direction}): {e}")
-        finally:
-            try:
-                writer.close()
-            except:
-                pass
-    
-    def get_current_proxy(self):
-        """获取当前代理"""
-        global current_proxy
-        
-        if not current_proxy:
-            logging.info("🔄 当前无代理，尝试自动获取...")
-            try:
-                newip_func = safe_import_getip()
-                if newip_func:
-                    current_proxy = newip_func()
-                    if current_proxy:
-                        proxy_stats['current_proxy'] = current_proxy
-                        proxy_stats['proxy_switches'] += 1
-                        logging.info(f"✅ 自动获取代理成功: {current_proxy}")
-                    else:
-                        logging.error("❌ 获取代理返回空值")
-                else:
-                    logging.error("❌ getip 模块不可用")
-            except Exception as e:
-                logging.error(f"❌ 自动获取代理失败: {e}")
-        
-        return current_proxy
-
 def init_country_monitor():
     """初始化国家监控"""
     global country_monitor
@@ -636,7 +5,12 @@ def init_country_monitor():
     target_country = config.get('target_country', 'US')
     check_interval = int(config.get('country_check_interval', '60'))
     
-    country_monitor = CountryMonitor(target_country, check_interval)
+    # 传递完整配置给CountryMonitor，启用黑名单功能
+    country_monitor = CountryMonitor(target_country, check_interval, config)
+    return country_monitorconfig.get('country_check_interval', '60'))
+    
+    # 传递完整配置给CountryMonitor，启用黑名单功能
+    country_monitor = CountryMonitor(target_country, check_interval, config)
     return country_monitor
 
 # HTML 模板（增强版 - 包含黑名单功能）
@@ -1498,7 +872,6 @@ def get_monitor_status():
             'error': str(e)
         }), 500
 
-# 新增：黑名单管理API
 @app.route('/api/blacklist/status')
 def get_blacklist_status():
     """获取黑名单详细状态"""
@@ -1562,7 +935,7 @@ def run_flask_app(port=5000):
     """运行Flask应用"""
     try:
         logging.info(f"🌐 启动 Web 管理界面: http://0.0.0.0:{port}")
-        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+        flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
     except Exception as e:
         logging.error(f"❌ Flask应用启动失败: {e}")
 
@@ -1632,7 +1005,7 @@ async def main():
     
     # 打印启动信息
     print("\n" + "="*70)
-    print("🐱 ProxyCat - 智能代理池管理系统 (最终版)")
+    print("🐱 ProxyCat - 智能代理池管理系统 (修复版)")
     print("="*70)
     print(f"🚀 SOCKS5 代理端口: {proxy_stats['port']}")
     print(f"🌐 Web 管理界面: http://localhost:{proxy_stats['web_port']}")
@@ -1682,9 +1055,9 @@ async def main():
     print("="*70)
     print("💡 使用提示:")
     print("   1. 访问 Web 界面启动自动监控")
-    print("   2. 自动监控已修复事件循环问题")
-    print("   3. 监控将在后台正常运行")
-    print("   4. 黑名单功能支持本地缓存和自动更新")
+    print("   2. 国家检测已修复，使用原版可靠方法")
+    print("   3. 黑名单功能已完美集成")
+    print("   4. 监控将在后台正常运行")
     print("="*70)
     
     # 启动Flask应用（在单独线程中）
@@ -1730,4 +1103,732 @@ if __name__ == '__main__':
     except Exception as e:
         logging.error(f"❌ 程序启动失败: {e}")
         import traceback
-        traceback.print_exc()
+        traceback.print_exc()#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+ProxyCat 最终版本 - 修复国家检测问题 + 集成黑名单功能
+"""
+
+import asyncio
+import socket
+import struct
+import threading
+import logging
+import os
+import sys
+import json
+import time
+import signal
+import importlib.util
+import subprocess
+from datetime import datetime
+from flask import Flask, request, jsonify, render_template_string
+from concurrent.futures import ThreadPoolExecutor
+
+# 添加当前目录到Python路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, current_dir)
+
+# 创建 Flask 应用
+app = Flask(__name__)
+
+# 全局变量
+current_proxy = None
+socks_server = None
+country_monitor = None
+main_loop = None  # 主事件循环
+executor = ThreadPoolExecutor(max_workers=4)  # 线程池
+
+proxy_stats = {
+    'current_proxy': None,
+    'current_country': None,
+    'total_checks': 0,
+    'proxy_switches': 0,
+    'country_changes': 0,
+    'blacklist_hits': 0,
+    'blacklist_size': 0,
+    'target_country': 'US',
+    'mode': 'country',
+    'language': 'cn',
+    'use_getip': True,
+    'port': 1080,
+    'web_port': 5000,
+    'connections_count': 0,
+    'bytes_transferred': 0
+}
+
+def load_simple_config():
+    """加载简化配置"""
+    config_path = os.path.join(current_dir, 'config', 'config.ini')
+    config = {
+        'mode': 'country',
+        'target_country': 'US',
+        'language': 'cn',
+        'use_getip': 'True',
+        'port': '1080',
+        'web_port': '5000',
+        'getip_url': '',
+        'buy_url_template': '',
+        'proxy_username': '',
+        'proxy_password': '',
+        'country_check_interval': '60',
+        'ip_blacklist_url': '',
+        'enable_ip_blacklist': 'True',
+        'blacklist_update_interval': '86400'
+    }
+    
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+                        config[key] = value
+        except Exception as e:
+            logging.error(f"读取配置文件失败: {e}")
+    
+    return config
+
+def safe_import_getip():
+    """安全导入 getip 模块"""
+    try:
+        getip_path = os.path.join(current_dir, 'modules', 'getip.py')
+        if not os.path.exists(getip_path):
+            logging.error(f"getip.py 文件不存在: {getip_path}")
+            return None
+        
+        # 动态导入 modules.modules（如果存在）
+        modules_path = os.path.join(current_dir, 'modules', 'modules.py')
+        if os.path.exists(modules_path):
+            modules_spec = importlib.util.spec_from_file_location("modules", modules_path)
+            modules_module = importlib.util.module_from_spec(modules_spec)
+            sys.modules['modules.modules'] = modules_module
+            modules_spec.loader.exec_module(modules_module)
+        
+        # 动态导入 getip
+        spec = importlib.util.spec_from_file_location("getip", getip_path)
+        getip_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(getip_module)
+        
+        logging.info("✅ getip 模块加载成功")
+        return getip_module.newip
+        
+    except Exception as e:
+        logging.error(f"❌ getip 模块加载失败: {e}")
+        return None
+
+def run_in_executor(func, *args):
+    """在线程池中运行同步函数"""
+    return executor.submit(func, *args)
+
+def schedule_coroutine(coro):
+    """在主事件循环中调度协程"""
+    if main_loop and main_loop.is_running():
+        future = asyncio.run_coroutine_threadsafe(coro, main_loop)
+        return future
+    else:
+        logging.error("❌ 主事件循环不可用")
+        return None
+
+class CountryMonitor:
+    """自动国家检测和代理切换系统 - 修复版"""
+    
+    def __init__(self, target_country='US', check_interval=60, config=None):
+        self.target_country = target_country
+        self.check_interval = check_interval
+        self.is_monitoring = False
+        self.last_check_time = 0
+        self.last_country = None
+        self.consecutive_failures = 0
+        self.max_failures = 3
+        self.monitor_task = None
+        
+        # 黑名单功能支持
+        self.config = config or {}
+        self.enable_blacklist = self.config.get('enable_ip_blacklist', 'True').lower() == 'true'
+        self.blacklist_url = self.config.get('ip_blacklist_url', '')
+        
+        # 初始化黑名单管理器
+        if self.enable_blacklist and self.blacklist_url:
+            try:
+                from modules.country_proxy_manager import CountryBasedProxyManager
+                self.proxy_manager = CountryBasedProxyManager(config or {})
+                logging.info("✅ 黑名单管理器初始化成功")
+            except Exception as e:
+                logging.error(f"❌ 黑名单管理器初始化失败: {e}")
+                self.proxy_manager = None
+        else:
+            self.proxy_manager = None
+            if not self.enable_blacklist:
+                logging.info("🚫 IP黑名单功能已禁用")
+            elif not self.blacklist_url:
+                logging.warning("⚠️ 未配置黑名单URL，黑名单功能不可用")
+        
+    async def start_monitoring(self):
+        """启动自动监控"""
+        if self.is_monitoring:
+            logging.warning("⚠️ 国家监控已在运行中")
+            return
+            
+        self.is_monitoring = True
+        logging.info(f"🌍 启动自动国家监控 - 目标国家: {self.target_country}, 检测间隔: {self.check_interval}秒")
+        
+        # 创建监控任务
+        self.monitor_task = asyncio.create_task(self._monitoring_loop())
+        
+    async def _monitoring_loop(self):
+        """监控循环"""
+        while self.is_monitoring:
+            try:
+                await self.check_and_switch_if_needed()
+                await asyncio.sleep(self.check_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"❌ 监控循环异常: {e}")
+                await asyncio.sleep(10)
+    
+    def stop_monitoring(self):
+        """停止监控"""
+        self.is_monitoring = False
+        if self.monitor_task:
+            self.monitor_task.cancel()
+        logging.info("🛑 自动国家监控已停止")
+    
+    async def check_and_switch_if_needed(self):
+        """检查当前代理国家，必要时切换"""
+        global current_proxy, proxy_stats
+        
+        if not current_proxy:
+            logging.info("🔄 当前无代理，尝试获取新代理...")
+            await self.switch_proxy("无代理")
+            return
+        
+        try:
+            # 使用原版的可靠检测方法（包含黑名单检查）
+            country = await self.detect_proxy_country(current_proxy)
+            
+            if country:
+                self.consecutive_failures = 0
+                proxy_stats['current_country'] = country
+                proxy_stats['total_checks'] += 1
+                self.last_check_time = time.time()
+                
+                if self.last_country != country:
+                    if self.last_country is not None:
+                        proxy_stats['country_changes'] += 1
+                        logging.info(f"🌍 检测到国家变化: {self.last_country} -> {country}")
+                    else:
+                        logging.info(f"🌍 首次检测到代理国家: {country}")
+                    
+                    self.last_country = country
+                
+                # 检查是否是黑名单IP
+                if country == 'BLACKLISTED':
+                    logging.warning("🚫 当前代理IP在黑名单中")
+                    proxy_stats['blacklist_hits'] += 1
+                    await self.switch_proxy("IP在黑名单中")
+                elif country != self.target_country:
+                    logging.warning(f"⚠️ 当前国家 {country} 不符合目标国家 {self.target_country}")
+                    await self.switch_proxy(f"国家不匹配 ({country} != {self.target_country})")
+                else:
+                    logging.info(f"✅ 代理国家检查通过: {country}")
+            
+            else:
+                self.consecutive_failures += 1
+                logging.error(f"❌ 代理国家检测失败 (连续失败 {self.consecutive_failures}/{self.max_failures})")
+                
+                if self.consecutive_failures >= self.max_failures:
+                    logging.error("❌ 连续检测失败次数过多，切换代理")
+                    await self.switch_proxy("连续检测失败")
+                    self.consecutive_failures = 0
+        
+        except Exception as e:
+            logging.error(f"❌ 国家检测过程异常: {e}")
+            self.consecutive_failures += 1
+    
+    async def detect_proxy_country(self, proxy_url):
+        """检测代理的真实出口国家（集成黑名单检查）"""
+        try:
+            proxy_for_curl = proxy_url
+            if proxy_for_curl.startswith('socks5://'):
+                proxy_for_curl = proxy_for_curl[9:]
+            
+            cmd = [
+                'curl', '-s', '--connect-timeout', '10', '--max-time', '15',
+                '-x', f'socks5://{proxy_for_curl}',
+                'https://ipinfo.io?token=2247bca03780c6'
+            ]
+            
+            # 在线程池中运行subprocess
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                executor, 
+                lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            )
+            
+            if result.returncode == 0:
+                try:
+                    data = json.loads(result.stdout)
+                    country = data.get('country')
+                    ip = data.get('ip')
+                    
+                    if country and ip:
+                        # 检查IP是否在黑名单中（如果黑名单管理器可用）
+                        if self.proxy_manager and self.proxy_manager.is_ip_blacklisted(ip):
+                            logging.warning(f"🚫 落地IP {ip} 在黑名单中，国家: {country}")
+                            proxy_stats['blacklist_hits'] += 1
+                            return 'BLACKLISTED'
+                        
+                        logging.debug(f"🌐 检测到代理信息: IP={ip}, 国家={country}")
+                        return country
+                    else:
+                        logging.warning("⚠️ IP检测响应缺少必要字段")
+                        return None
+                        
+                except json.JSONDecodeError:
+                    logging.error("❌ IP检测服务返回无效JSON")
+                    return None
+            else:
+                error_msg = result.stderr.strip() if result.stderr else "未知错误"
+                logging.error(f"❌ curl 检测失败: {error_msg}")
+                return None
+                
+        except Exception as e:
+            logging.error(f"❌ 代理国家检测异常: {e}")
+            return None
+    
+    async def switch_proxy(self, reason):
+        """切换到新代理"""
+        global current_proxy, proxy_stats
+        
+        logging.info(f"🔄 开始切换代理，原因: {reason}")
+        
+        try:
+            newip_func = safe_import_getip()
+            if not newip_func:
+                logging.error("❌ getip 模块不可用，无法切换代理")
+                return False
+            
+            max_attempts = 5
+            for attempt in range(max_attempts):
+                try:
+                    # 在线程池中获取新代理
+                    loop = asyncio.get_event_loop()
+                    new_proxy = await loop.run_in_executor(executor, newip_func)
+                    
+                    if new_proxy:
+                        logging.info(f"🧪 验证新代理国家 (尝试 {attempt + 1}/{max_attempts})")
+                        # 使用统一的检测方法
+                        country = await self.detect_proxy_country(new_proxy)
+                        
+                        if country == self.target_country:
+                            old_proxy = current_proxy
+                            current_proxy = new_proxy
+                            proxy_stats['current_proxy'] = new_proxy
+                            proxy_stats['current_country'] = country
+                            proxy_stats['proxy_switches'] += 1
+                            self.last_country = country
+                            
+                            logging.info(f"✅ 代理切换成功: {country} ({new_proxy.split('@')[-1] if '@' in new_proxy else new_proxy})")
+                            return True
+                        
+                        elif country == 'BLACKLISTED':
+                            logging.warning(f"⚠️ 新代理IP在黑名单中，重试...")
+                        elif country:
+                            logging.warning(f"⚠️ 新代理国家 {country} 不符合目标 {self.target_country}，重试...")
+                        else:
+                            logging.warning("⚠️ 新代理国家检测失败，重试...")
+                    
+                    else:
+                        logging.error("❌ 获取新代理返回空值")
+                    
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(2)
+                        
+                except Exception as e:
+                    logging.error(f"❌ 获取新代理失败 (尝试 {attempt + 1}): {e}")
+                    if attempt < max_attempts - 1:
+                        await asyncio.sleep(2)
+            
+            logging.error(f"❌ 在 {max_attempts} 次尝试后仍无法获取符合要求的代理")
+            return False
+            
+        except Exception as e:
+            logging.error(f"❌ 代理切换过程异常: {e}")
+            return False
+    
+    def get_stats(self):
+        """获取监控统计信息"""
+        base_stats = {
+            'is_monitoring': self.is_monitoring,
+            'target_country': self.target_country,
+            'check_interval': self.check_interval,
+            'last_check_time': datetime.fromtimestamp(self.last_check_time).isoformat() if self.last_check_time else None,
+            'last_country': self.last_country,
+            'consecutive_failures': self.consecutive_failures
+        }
+        
+        # 添加黑名单统计
+        if self.proxy_manager:
+            blacklist_stats = self.proxy_manager.get_blacklist_stats()
+            base_stats.update({
+                'blacklist_enabled': blacklist_stats['enabled'],
+                'blacklist_loaded': blacklist_stats['loaded'],
+                'blacklist_size': blacklist_stats['size'],
+                'blacklist_source': blacklist_stats['source'],
+                'blacklist_needs_update': blacklist_stats['needs_update']
+            })
+        else:
+            base_stats.update({
+                'blacklist_enabled': self.enable_blacklist,
+                'blacklist_loaded': False,
+                'blacklist_size': 0,
+                'blacklist_source': 'disabled' if not self.enable_blacklist else 'not_configured',
+                'blacklist_needs_update': False
+            })
+        
+        return base_stats
+    
+    def get_blacklist_stats(self):
+        """获取黑名单详细统计信息"""
+        if self.proxy_manager:
+            return self.proxy_manager.get_blacklist_stats()
+        else:
+            return {
+                'enabled': self.enable_blacklist,
+                'loaded': False,
+                'size': 0,
+                'source': 'disabled' if not self.enable_blacklist else 'not_configured',
+                'needs_update': False,
+                'last_update': None,
+                'cache_file_exists': False,
+                'meta_file_exists': False,
+                'hours_since_update': 0,
+                'update_interval_hours': 0,
+                'url': self.blacklist_url,
+                'meta_info': {}
+            }
+    
+    def force_update_blacklist(self):
+        """强制更新黑名单"""
+        if self.proxy_manager:
+            return self.proxy_manager.force_update_blacklist()
+        else:
+            logging.warning("⚠️ 黑名单管理器不可用")
+            return None
+
+class SOCKS5Server:
+    """完整的 SOCKS5 代理服务器"""
+    
+    def __init__(self, host='0.0.0.0', port=1080):
+        self.host = host
+        self.port = port
+        self.running = False
+        self.server = None
+        
+    async def start(self):
+        """启动 SOCKS5 服务器"""
+        try:
+            self.running = True
+            self.server = await asyncio.start_server(
+                self.handle_client, self.host, self.port
+            )
+            
+            logging.info(f"🚀 SOCKS5 服务器已启动: {self.host}:{self.port}")
+            
+            async with self.server:
+                await self.server.serve_forever()
+                
+        except Exception as e:
+            logging.error(f"❌ SOCKS5 服务器启动失败: {e}")
+            self.running = False
+    
+    async def stop(self):
+        """停止 SOCKS5 服务器"""
+        self.running = False
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+            logging.info("🛑 SOCKS5 服务器已停止")
+    
+    async def handle_client(self, reader, writer):
+        """处理客户端连接"""
+        client_addr = writer.get_extra_info('peername')
+        logging.info(f"📱 新客户端连接: {client_addr}")
+        proxy_stats['connections_count'] += 1
+        
+        try:
+            if not await self.socks5_handshake(reader, writer):
+                return
+            
+            target_host, target_port = await self.socks5_connect_request(reader, writer)
+            if not target_host:
+                return
+            
+            await self.proxy_connection(target_host, target_port, reader, writer)
+            
+        except Exception as e:
+            logging.error(f"❌ 处理客户端连接失败 {client_addr}: {e}")
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except:
+                pass
+            logging.debug(f"🔌 客户端连接关闭: {client_addr}")
+    
+    async def socks5_handshake(self, reader, writer):
+        """SOCKS5 握手"""
+        try:
+            data = await asyncio.wait_for(reader.read(1024), timeout=10)
+            
+            if len(data) < 3 or data[0] != 0x05:
+                logging.warning("❌ 无效的 SOCKS5 握手")
+                return False
+            
+            writer.write(b'\x05\x00')
+            await writer.drain()
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"❌ SOCKS5 握手失败: {e}")
+            return False
+    
+    async def socks5_connect_request(self, reader, writer):
+        """处理 SOCKS5 连接请求"""
+        try:
+            data = await asyncio.wait_for(reader.read(1024), timeout=10)
+            
+            if len(data) < 10 or data[0] != 0x05:
+                logging.warning("❌ 无效的 SOCKS5 连接请求")
+                return None, None
+            
+            cmd = data[1]
+            atyp = data[3]
+            
+            if cmd != 0x01:
+                writer.write(b'\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00')
+                await writer.drain()
+                return None, None
+            
+            if atyp == 0x01:  # IPv4
+                target_host = socket.inet_ntoa(data[4:8])
+                target_port = struct.unpack('>H', data[8:10])[0]
+            elif atyp == 0x03:  # 域名
+                addr_len = data[4]
+                target_host = data[5:5+addr_len].decode('utf-8')
+                target_port = struct.unpack('>H', data[5+addr_len:7+addr_len])[0]
+            else:
+                logging.warning(f"❌ 不支持的地址类型: {atyp}")
+                writer.write(b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00')
+                await writer.drain()
+                return None, None
+            
+            logging.info(f"🎯 连接目标: {target_host}:{target_port}")
+            return target_host, target_port
+            
+        except Exception as e:
+            logging.error(f"❌ 解析连接请求失败: {e}")
+            return None, None
+    
+    async def proxy_connection(self, target_host, target_port, client_reader, client_writer):
+        """通过上游代理连接目标"""
+        proxy_url = self.get_current_proxy()
+        
+        if not proxy_url:
+            logging.error("❌ 没有可用的代理")
+            client_writer.write(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
+            await client_writer.drain()
+            return
+        
+        try:
+            proxy_info = self.parse_proxy_url(proxy_url)
+            if not proxy_info:
+                raise Exception("无效的代理URL")
+            
+            proxy_reader, proxy_writer = await asyncio.wait_for(
+                asyncio.open_connection(proxy_info['host'], proxy_info['port']),
+                timeout=10
+            )
+            
+            success = await self.upstream_socks5_handshake(
+                proxy_reader, proxy_writer, proxy_info
+            )
+            
+            if not success:
+                raise Exception("上游代理握手失败")
+            
+            success = await self.upstream_connect_request(
+                proxy_reader, proxy_writer, target_host, target_port
+            )
+            
+            if not success:
+                raise Exception("上游代理连接目标失败")
+            
+            client_writer.write(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
+            await client_writer.drain()
+            
+            logging.info(f"✅ 代理连接建立: {target_host}:{target_port}")
+            
+            await asyncio.gather(
+                self.pipe_data(client_reader, proxy_writer, "客户端->代理"),
+                self.pipe_data(proxy_reader, client_writer, "代理->客户端"),
+                return_exceptions=True
+            )
+            
+        except Exception as e:
+            logging.error(f"❌ 代理连接失败: {e}")
+            try:
+                client_writer.write(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
+                await client_writer.drain()
+            except:
+                pass
+    
+    def parse_proxy_url(self, proxy_url):
+        """解析代理URL"""
+        try:
+            if '://' in proxy_url:
+                proxy_url = proxy_url.split('://', 1)[1]
+            
+            if '@' in proxy_url:
+                auth_part, addr_part = proxy_url.split('@', 1)
+                username, password = auth_part.split(':', 1)
+                host, port = addr_part.split(':', 1)
+            else:
+                username = password = None
+                host, port = proxy_url.split(':', 1)
+            
+            return {
+                'host': host,
+                'port': int(port),
+                'username': username,
+                'password': password
+            }
+            
+        except Exception as e:
+            logging.error(f"❌ 解析代理URL失败: {e}")
+            return None
+    
+    async def upstream_socks5_handshake(self, reader, writer, proxy_info):
+        """与上游代理进行 SOCKS5 握手"""
+        try:
+            if proxy_info['username'] and proxy_info['password']:
+                writer.write(b'\x05\x02\x00\x02')
+            else:
+                writer.write(b'\x05\x01\x00')
+            
+            await writer.drain()
+            
+            response = await asyncio.wait_for(reader.read(2), timeout=10)
+            
+            if len(response) != 2 or response[0] != 0x05:
+                return False
+            
+            if response[1] == 0x02:
+                if not proxy_info['username'] or not proxy_info['password']:
+                    return False
+                
+                username = proxy_info['username'].encode('utf-8')
+                password = proxy_info['password'].encode('utf-8')
+                auth_data = struct.pack('B', len(username)) + username + struct.pack('B', len(password)) + password
+                writer.write(b'\x01' + auth_data)
+                await writer.drain()
+                
+                auth_response = await asyncio.wait_for(reader.read(2), timeout=10)
+                if auth_response != b'\x01\x00':
+                    return False
+            
+            elif response[1] != 0x00:
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"❌ 上游代理握手失败: {e}")
+            return False
+    
+    async def upstream_connect_request(self, reader, writer, target_host, target_port):
+        """请求上游代理连接目标"""
+        try:
+            if target_host.replace('.', '').isdigit():
+                addr_data = b'\x01' + socket.inet_aton(target_host)
+            else:
+                target_host_bytes = target_host.encode('utf-8')
+                addr_data = b'\x03' + struct.pack('B', len(target_host_bytes)) + target_host_bytes
+            
+            request_data = b'\x05\x01\x00' + addr_data + struct.pack('>H', target_port)
+            writer.write(request_data)
+            await writer.drain()
+            
+            response = await asyncio.wait_for(reader.read(1024), timeout=15)
+            
+            if len(response) < 2 or response[0] != 0x05 or response[1] != 0x00:
+                logging.error(f"❌ 上游代理连接失败，响应码: {response[1] if len(response) > 1 else 'unknown'}")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"❌ 上游代理连接请求失败: {e}")
+            return False
+    
+    async def pipe_data(self, reader, writer, direction):
+        """数据转发"""
+        try:
+            while True:
+                data = await reader.read(8192)
+                if not data:
+                    break
+                
+                writer.write(data)
+                await writer.drain()
+                
+                proxy_stats['bytes_transferred'] += len(data)
+                
+        except Exception as e:
+            logging.debug(f"🔄 数据转发结束 ({direction}): {e}")
+        finally:
+            try:
+                writer.close()
+            except:
+                pass
+    
+    def get_current_proxy(self):
+        """获取当前代理"""
+        global current_proxy
+        
+        if not current_proxy:
+            logging.info("🔄 当前无代理，尝试自动获取...")
+            try:
+                newip_func = safe_import_getip()
+                if newip_func:
+                    current_proxy = newip_func()
+                    if current_proxy:
+                        proxy_stats['current_proxy'] = current_proxy
+                        proxy_stats['proxy_switches'] += 1
+                        logging.info(f"✅ 自动获取代理成功: {current_proxy}")
+                    else:
+                        logging.error("❌ 获取代理返回空值")
+                else:
+                    logging.error("❌ getip 模块不可用")
+            except Exception as e:
+                logging.error(f"❌ 自动获取代理失败: {e}")
+        
+        return current_proxy
+
+def init_country_monitor():
+    """初始化国家监控"""
+    global country_monitor
+    config = load_simple_config()
+    target_country = config.get('target_country', 'US')
+    check_interval = int(config.get('country_check_interval', '60'))
+    
+    # 传递完整配置给CountryMonitor，启用黑名单功能
+    country_monitor = CountryMonitor(target_country, check_interval, config)
+    return country_monitor
