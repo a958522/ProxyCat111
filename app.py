@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-ProxyCat 最终版本 - 解决事件循环问题
+ProxyCat 最终版本 - 解决事件循环问题 + 黑名单本地缓存功能
 """
 
 import asyncio
@@ -639,7 +639,7 @@ def init_country_monitor():
     country_monitor = CountryMonitor(target_country, check_interval)
     return country_monitor
 
-# HTML 模板（简化版）
+# HTML 模板（增强版 - 包含黑名单功能）
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -689,7 +689,7 @@ HTML_TEMPLATE = '''
         .main-content { padding: 30px; }
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
             gap: 15px;
             margin-bottom: 25px;
         }
@@ -700,9 +700,12 @@ HTML_TEMPLATE = '''
             box-shadow: 0 5px 15px rgba(0, 0, 0, 0.08);
             border-left: 4px solid #3498db;
             text-align: center;
+            transition: transform 0.2s;
         }
+        .stat-card:hover { transform: translateY(-2px); }
+        .stat-card.blacklist { border-left-color: #e74c3c; }
         .stat-value {
-            font-size: 1.6em;
+            font-size: 1.4em;
             font-weight: bold;
             margin-bottom: 5px;
             color: #2c3e50;
@@ -730,22 +733,26 @@ HTML_TEMPLATE = '''
             cursor: pointer;
             font-size: 13px;
             margin: 3px;
-            transition: background-color 0.3s;
+            transition: all 0.3s;
             font-weight: 500;
         }
-        .btn:hover { background: #2980b9; }
+        .btn:hover { background: #2980b9; transform: translateY(-1px); }
         .btn.success { background: #27ae60; }
         .btn.success:hover { background: #229954; }
         .btn.warning { background: #f39c12; }
+        .btn.warning:hover { background: #e67e22; }
         .btn.danger { background: #e74c3c; }
-        .btn:disabled { background: #95a5a6; cursor: not-allowed; }
+        .btn.danger:hover { background: #c0392b; }
+        .btn:disabled { background: #95a5a6; cursor: not-allowed; transform: none; }
         .input-field {
             padding: 8px 12px;
             border: 2px solid #ecf0f1;
             border-radius: 6px;
             font-size: 13px;
             margin: 3px;
+            transition: border-color 0.3s;
         }
+        .input-field:focus { border-color: #3498db; outline: none; }
         .proxy-info {
             background: #f8f9fa;
             border: 1px solid #dee2e6;
@@ -763,6 +770,16 @@ HTML_TEMPLATE = '''
             padding: 12px;
             margin: 10px 0;
             font-size: 13px;
+            line-height: 1.4;
+        }
+        .blacklist-info {
+            background: #fff3e0;
+            border: 1px solid #ffb74d;
+            border-radius: 8px;
+            padding: 12px;
+            margin: 10px 0;
+            font-size: 13px;
+            line-height: 1.4;
         }
         .alert {
             padding: 15px;
@@ -772,6 +789,11 @@ HTML_TEMPLATE = '''
             right: 20px;
             z-index: 9999;
             min-width: 300px;
+            animation: slideIn 0.3s ease;
+        }
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
         }
         .alert.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
         .alert.error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
@@ -815,6 +837,18 @@ HTML_TEMPLATE = '''
                     <div class="stat-value" id="current-country">-</div>
                     <div class="stat-label">当前国家</div>
                 </div>
+                <div class="stat-card blacklist">
+                    <div class="stat-value" id="blacklist-status">-</div>
+                    <div class="stat-label">黑名单状态</div>
+                </div>
+                <div class="stat-card blacklist">
+                    <div class="stat-value" id="blacklist-size">0</div>
+                    <div class="stat-label">黑名单大小</div>
+                </div>
+                <div class="stat-card blacklist">
+                    <div class="stat-value" id="blacklist-hits">0</div>
+                    <div class="stat-label">黑名单拦截</div>
+                </div>
                 <div class="stat-card">
                     <div class="stat-value" id="bytes-transferred">0 B</div>
                     <div class="stat-label">数据传输</div>
@@ -838,6 +872,19 @@ HTML_TEMPLATE = '''
                     <button class="btn success" id="start-monitor-btn" onclick="startMonitoring()">▶️ 启动监控</button>
                     <button class="btn danger" id="stop-monitor-btn" onclick="stopMonitoring()">⏹️ 停止监控</button>
                     <button class="btn" onclick="checkMonitorStatus()">📋 检查状态</button>
+                </div>
+            </div>
+            
+            <div class="control-panel">
+                <h3>🛡️ 黑名单管理</h3>
+                
+                <div class="blacklist-info" id="blacklist-info">
+                    黑名单信息加载中...
+                </div>
+                
+                <div>
+                    <button class="btn" onclick="checkBlacklistStatus()">📋 检查状态</button>
+                    <button class="btn warning" onclick="forceUpdateBlacklist()">🔄 强制更新</button>
                 </div>
             </div>
             
@@ -866,6 +913,7 @@ HTML_TEMPLATE = '''
         document.addEventListener('DOMContentLoaded', function() {
             refreshStats();
             checkMonitorStatus();
+            checkBlacklistStatus();
             startAutoRefresh();
         });
         
@@ -902,12 +950,26 @@ HTML_TEMPLATE = '''
             }
         }
         
+        async function checkBlacklistStatus() {
+            try {
+                const response = await fetch('/api/blacklist/status');
+                const data = await response.json();
+                
+                if (data.success) {
+                    updateBlacklistInfo(data.data);
+                }
+            } catch (error) {
+                console.error('检查黑名单状态失败:', error);
+            }
+        }
+        
         function updateStatsDisplay(stats) {
             document.getElementById('connections-count').textContent = stats.connections_count || 0;
             document.getElementById('proxy-switches').textContent = stats.proxy_switches || 0;
             document.getElementById('total-checks').textContent = stats.total_checks || 0;
             document.getElementById('country-changes').textContent = stats.country_changes || 0;
             document.getElementById('current-country').textContent = stats.current_country || '-';
+            document.getElementById('blacklist-hits').textContent = stats.blacklist_hits || 0;
             
             const bytes = stats.bytes_transferred || 0;
             let size = bytes < 1024 ? bytes + ' B' :
@@ -915,6 +977,26 @@ HTML_TEMPLATE = '''
                       (bytes/1024/1024).toFixed(1) + ' MB';
             document.getElementById('bytes-transferred').textContent = size;
             
+            // 更新黑名单状态
+            const blacklistStatus = document.getElementById('blacklist-status');
+            const blacklistSize = document.getElementById('blacklist-size');
+            
+            if (stats.blacklist_enabled) {
+                if (stats.blacklist_loaded) {
+                    blacklistStatus.textContent = '✅ 已加载';
+                    blacklistStatus.style.color = '#27ae60';
+                } else {
+                    blacklistStatus.textContent = '❌ 失败';
+                    blacklistStatus.style.color = '#e74c3c';
+                }
+                blacklistSize.textContent = stats.blacklist_size || 0;
+            } else {
+                blacklistStatus.textContent = '🚫 禁用';
+                blacklistStatus.style.color = '#95a5a6';
+                blacklistSize.textContent = '0';
+            }
+            
+            // 更新代理显示
             const proxyDisplay = document.getElementById('current-proxy-display');
             if (stats.current_proxy) {
                 const displayProxy = stats.current_proxy.includes('@') ? 
@@ -953,6 +1035,48 @@ HTML_TEMPLATE = '''
                 <strong>上次检测:</strong> ${monitorData.last_check_time ? new Date(monitorData.last_check_time).toLocaleString() : '未检测'}<br>
                 <strong>连续失败:</strong> ${monitorData.consecutive_failures}次
             `;
+            infoEl.innerHTML = infoHtml;
+        }
+        
+        function updateBlacklistInfo(blacklistData) {
+            const infoEl = document.getElementById('blacklist-info');
+            
+            if (!blacklistData.enabled) {
+                infoEl.innerHTML = '<strong>状态:</strong> 🚫 功能已禁用';
+                return;
+            }
+            
+            let statusText = blacklistData.loaded ? '✅ 已加载' : '❌ 未加载';
+            let sourceText = {
+                'local': '本地缓存',
+                'remote': '远程下载', 
+                'remote_sync': '远程同步',
+                'remote_async': '远程异步',
+                'empty': '空',
+                'disabled': '禁用',
+                'unknown': '未知'
+            }[blacklistData.source] || blacklistData.source;
+            
+            let updateText = blacklistData.needs_update ? '⏰ 需要更新' : '✅ 最新';
+            
+            let infoHtml = `
+                <strong>状态:</strong> ${statusText}<br>
+                <strong>大小:</strong> ${blacklistData.size} 条记录<br>
+                <strong>来源:</strong> ${sourceText}<br>
+                <strong>更新状态:</strong> ${updateText}<br>
+                <strong>上次更新:</strong> ${blacklistData.last_update ? 
+                    new Date(blacklistData.last_update).toLocaleString() : '从未更新'}<br>
+                <strong>缓存文件:</strong> ${blacklistData.cache_file_exists ? '✅ 存在' : '❌ 不存在'}<br>
+                <strong>更新间隔:</strong> ${blacklistData.update_interval_hours}小时
+            `;
+            
+            if (blacklistData.meta_info && blacklistData.meta_info.valid_count) {
+                infoHtml += `<br><strong>有效记录:</strong> ${blacklistData.meta_info.valid_count}`;
+                if (blacklistData.meta_info.invalid_count > 0) {
+                    infoHtml += ` (忽略 ${blacklistData.meta_info.invalid_count} 条无效记录)`;
+                }
+            }
+            
             infoEl.innerHTML = infoHtml;
         }
         
@@ -1045,6 +1169,27 @@ HTML_TEMPLATE = '''
                     showAlert('目标国家更新成功！', 'success');
                     refreshStats();
                     checkMonitorStatus();
+                } else {
+                    showAlert('更新失败: ' + data.error, 'error');
+                }
+            } catch (error) {
+                showAlert('更新失败: ' + error.message, 'error');
+            }
+        }
+        
+        async function forceUpdateBlacklist() {
+            try {
+                showAlert('正在强制更新黑名单...', 'warning');
+                const response = await fetch('/api/blacklist/update', { method: 'POST' });
+                const data = await response.json();
+                
+                if (data.success) {
+                    showAlert('黑名单更新已启动！', 'success');
+                    // 5秒后检查状态
+                    setTimeout(() => {
+                        checkBlacklistStatus();
+                        refreshStats();
+                    }, 5000);
                 } else {
                     showAlert('更新失败: ' + data.error, 'error');
                 }
@@ -1353,6 +1498,66 @@ def get_monitor_status():
             'error': str(e)
         }), 500
 
+# 新增：黑名单管理API
+@app.route('/api/blacklist/status')
+def get_blacklist_status():
+    """获取黑名单详细状态"""
+    try:
+        if country_monitor and hasattr(country_monitor, 'get_blacklist_stats'):
+            blacklist_stats = country_monitor.get_blacklist_stats()
+            return jsonify({
+                'success': True,
+                'data': blacklist_stats
+            })
+        else:
+            return jsonify({
+                'success': True,
+                'data': {
+                    'enabled': False,
+                    'loaded': False,
+                    'size': 0,
+                    'source': 'not_available',
+                    'needs_update': False
+                }
+            })
+    except Exception as e:
+        logging.error(f"❌ 获取黑名单状态失败: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/blacklist/update', methods=['POST'])
+def force_update_blacklist():
+    """强制更新黑名单"""
+    try:
+        if not country_monitor or not hasattr(country_monitor, 'force_update_blacklist'):
+            return jsonify({
+                'success': False,
+                'error': '黑名单功能不可用'
+            }), 400
+        
+        if not getattr(country_monitor, 'enable_blacklist', False):
+            return jsonify({
+                'success': False,
+                'error': '黑名单功能已禁用'
+            }), 400
+        
+        # 强制更新黑名单
+        task = country_monitor.force_update_blacklist()
+        
+        return jsonify({
+            'success': True,
+            'message': '黑名单更新已开始，请稍后查看状态'
+        })
+        
+    except Exception as e:
+        logging.error(f"❌ 强制更新黑名单失败: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
 def run_flask_app(port=5000):
     """运行Flask应用"""
     try:
@@ -1433,6 +1638,37 @@ async def main():
     print(f"🌐 Web 管理界面: http://localhost:{proxy_stats['web_port']}")
     print(f"🎯 目标国家: {proxy_stats['target_country']}")
     print(f"🤖 自动监控间隔: {country_monitor.check_interval}秒")
+    
+    # 显示黑名单状态
+    if country_monitor and hasattr(country_monitor, 'get_blacklist_stats'):
+        try:
+            blacklist_stats = country_monitor.get_blacklist_stats()
+            if blacklist_stats['enabled']:
+                if blacklist_stats['loaded']:
+                    source_text = {
+                        'local': '本地缓存',
+                        'remote': '远程下载',
+                        'remote_sync': '远程同步',
+                        'remote_async': '远程异步'
+                    }.get(blacklist_stats['source'], '未知')
+                    
+                    print(f"🛡️  IP黑名单: ✅ 已加载 ({blacklist_stats['size']} 条记录, 来源: {source_text})")
+                    
+                    if blacklist_stats['needs_update']:
+                        print("⏰ 黑名单将在后台自动更新")
+                    else:
+                        hours_old = blacklist_stats['hours_since_update']
+                        print(f"📅 黑名单状态: 最新 (上次更新: {hours_old:.1f}小时前)")
+                else:
+                    print("🛡️  IP黑名单: ❌ 加载失败")
+            else:
+                print("🛡️  IP黑名单: 🚫 功能已禁用")
+        except Exception as e:
+            print("🛡️  IP黑名单: ⚠️ 状态检查失败")
+            logging.debug(f"黑名单状态检查失败: {e}")
+    else:
+        print("🛡️  IP黑名单: ⚠️ 功能不可用 (需要更新 country_proxy_manager.py)")
+    
     print("="*70)
     
     # 检查 getip 模块
@@ -1448,6 +1684,7 @@ async def main():
     print("   1. 访问 Web 界面启动自动监控")
     print("   2. 自动监控已修复事件循环问题")
     print("   3. 监控将在后台正常运行")
+    print("   4. 黑名单功能支持本地缓存和自动更新")
     print("="*70)
     
     # 启动Flask应用（在单独线程中）
