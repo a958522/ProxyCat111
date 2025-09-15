@@ -178,7 +178,8 @@ class CountryMonitor:
         
     async def _monitoring_loop(self):
         """监控循环 - 增强版，包含黑名单定时更新"""
-        blacklist_check_interval = 300  # 5分钟检查一次黑名单
+        # 🔧 修复：从配置中读取黑名单检查间隔，而不是硬编码
+        blacklist_check_interval = int(self.config.get('blacklist_check_interval', '300'))  # 默认5分钟
         last_blacklist_check = 0
         
         while self.is_monitoring:
@@ -303,543 +304,6 @@ class CountryMonitor:
             )
             
             if result.returncode == 0:
-            try:
-                data = json.loads(result.stdout)
-                ip = data.get('ip', 'Unknown')
-                country = data.get('country', 'Unknown')
-                
-                proxy_stats['current_country'] = country
-                
-                logging.info(f"✅ 代理测试成功: IP={ip}, 国家={country}")
-                return jsonify({
-                    'success': True,
-                    'ip': ip,
-                    'country': country,
-                    'full_info': data
-                })
-            except json.JSONDecodeError:
-                return jsonify({
-                    'success': False,
-                    'error': 'IP检测服务返回无效数据'
-                })
-        else:
-            error_msg = result.stderr or '代理连接失败'
-            logging.error(f"❌ 代理测试失败: {error_msg}")
-            return jsonify({
-                'success': False,
-                'error': error_msg
-            })
-            
-    except subprocess.TimeoutExpired:
-        return jsonify({
-            'success': False,
-            'error': '代理测试超时'
-        })
-    except Exception as e:
-        logging.error(f"❌ 代理测试异常: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/proxy/country', methods=['GET', 'POST'])
-def manage_target_country():
-    global proxy_stats, country_monitor
-    
-    if request.method == 'GET':
-        try:
-            return jsonify({
-                'success': True,
-                'target_country': proxy_stats['target_country']
-            })
-        except Exception as e:
-            return jsonify({
-                'success': False,
-                'error': str(e)
-            }), 500
-    
-    elif request.method == 'POST':
-        try:
-            data = request.get_json()
-            country = data.get('country', '').strip().upper()
-            
-            if len(country) != 2:
-                return jsonify({
-                    'success': False,
-                    'error': '国家代码必须是2位字母'
-                }), 400
-            
-            proxy_stats['target_country'] = country
-            
-            if country_monitor:
-                country_monitor.target_country = country
-                logging.info(f"🎯 监控器目标国家已更新为: {country}")
-            
-            logging.info(f"🎯 目标国家已设置为: {country}")
-            
-            return jsonify({
-                'success': True,
-                'message': f'目标国家已设置为: {country}'
-            })
-        except Exception as e:
-            logging.error(f"❌ 设置目标国家失败: {e}")
-            return jsonify({
-                'success': False,
-                'error': str(e)
-            }), 500
-
-@app.route('/api/monitor/start', methods=['POST'])
-def start_country_monitoring():
-    """启动自动国家监控"""
-    global country_monitor, main_loop
-    
-    try:
-        if not country_monitor:
-            country_monitor = init_country_monitor()
-        
-        if country_monitor.is_monitoring:
-            return jsonify({
-                'success': False,
-                'message': '监控已在运行中'
-            })
-        
-        # 在主事件循环中启动监控
-        if main_loop and main_loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(
-                country_monitor.start_monitoring(), 
-                main_loop
-            )
-            # 不等待完成，让它在后台运行
-            
-            return jsonify({
-                'success': True,
-                'message': '自动国家监控已启动',
-                'target_country': country_monitor.target_country,
-                'check_interval': country_monitor.check_interval
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'error': '主事件循环不可用'
-            }), 500
-        
-    except Exception as e:
-        logging.error(f"❌ 启动监控失败: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/monitor/stop', methods=['POST'])
-def stop_country_monitoring():
-    """停止自动国家监控"""
-    global country_monitor
-    
-    try:
-        if country_monitor and country_monitor.is_monitoring:
-            country_monitor.stop_monitoring()
-            return jsonify({
-                'success': True,
-                'message': '自动国家监控已停止'
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'message': '监控未在运行'
-            })
-            
-    except Exception as e:
-        logging.error(f"❌ 停止监控失败: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/monitor/status')
-def get_monitor_status():
-    """获取监控状态"""
-    global country_monitor
-    
-    try:
-        if country_monitor:
-            monitor_stats = country_monitor.get_stats()
-            return jsonify({
-                'success': True,
-                'data': monitor_stats
-            })
-        else:
-            return jsonify({
-                'success': True,
-                'data': {
-                    'is_monitoring': False,
-                    'target_country': proxy_stats.get('target_country', 'US'),
-                    'check_interval': 60,
-                    'last_check_time': None,
-                    'last_country': None,
-                    'consecutive_failures': 0
-                }
-            })
-            
-    except Exception as e:
-        logging.error(f"❌ 获取监控状态失败: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/blacklist/status')
-def get_blacklist_status():
-    """获取黑名单详细状态"""
-    try:
-        if country_monitor and hasattr(country_monitor, 'get_blacklist_stats'):
-            blacklist_stats = country_monitor.get_blacklist_stats()
-            return jsonify({
-                'success': True,
-                'data': blacklist_stats
-            })
-        else:
-            return jsonify({
-                'success': True,
-                'data': {
-                    'enabled': False,
-                    'loaded': False,
-                    'size': 0,
-                    'source': 'not_available',
-                    'needs_update': False
-                }
-            })
-    except Exception as e:
-        logging.error(f"❌ 获取黑名单状态失败: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/blacklist/update', methods=['POST'])
-def force_update_blacklist():
-    """强制更新黑名单 - 最终修复版"""
-    try:
-        if not country_monitor or not hasattr(country_monitor, 'proxy_manager'):
-            return jsonify({
-                'success': False,
-                'error': '黑名单功能不可用'
-            }), 400
-        
-        proxy_manager = country_monitor.proxy_manager
-        if not proxy_manager:
-            return jsonify({
-                'success': False,
-                'error': '黑名单管理器未初始化'
-            }), 400
-            
-        if not getattr(proxy_manager, 'enable_blacklist', False):
-            return jsonify({
-                'success': False,
-                'error': '黑名单功能已禁用'
-            }), 400
-        
-        try:
-            logging.info("🔄 Web界面触发黑名单强制更新...")
-            
-            # 记录更新前状态
-            old_size = len(proxy_manager.ip_blacklist)
-            old_update_time = proxy_manager.blacklist_last_update
-            
-            # 重置更新时间，强制更新
-            proxy_manager.blacklist_last_update = 0
-            
-            # 执行同步下载
-            success = proxy_manager._sync_download_blacklist()
-            
-            if success:
-                new_size = len(proxy_manager.ip_blacklist)
-                logging.info(f"✅ Web界面黑名单强制更新成功: {old_size} -> {new_size} 条记录")
-                
-                return jsonify({
-                    'success': True,
-                    'message': f'黑名单强制更新成功，从 {old_size} 更新到 {new_size} 条记录',
-                    'old_size': old_size,
-                    'new_size': new_size
-                })
-            else:
-                # 恢复原时间
-                proxy_manager.blacklist_last_update = old_update_time
-                logging.error("❌ Web界面黑名单强制更新失败")
-                
-                return jsonify({
-                    'success': False,
-                    'error': '黑名单下载失败，请检查网络连接和URL配置'
-                })
-                
-        except Exception as e:
-            logging.error(f"❌ 黑名单强制更新异常: {e}")
-            return jsonify({
-                'success': False,
-                'error': f'更新异常: {str(e)}'
-            })
-        
-    except Exception as e:
-        logging.error(f"❌ 强制更新黑名单路由失败: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/blacklist/debug')
-def debug_blacklist():
-    """调试黑名单状态 - 详细信息"""
-    try:
-        if not country_monitor or not country_monitor.proxy_manager:
-            return jsonify({
-                'success': False,
-                'error': '黑名单管理器不可用'
-            })
-        
-        manager = country_monitor.proxy_manager
-        current_time = time.time()
-        
-        debug_info = {
-            # 基本状态
-            'enabled': manager.enable_blacklist,
-            'loaded': manager.blacklist_loaded,
-            'size': len(manager.ip_blacklist),
-            'url': manager.blacklist_url,
-            
-            # 时间相关
-            'update_interval_seconds': manager.blacklist_update_interval,
-            'update_interval_hours': manager.blacklist_update_interval / 3600,
-            'last_update_timestamp': manager.blacklist_last_update,
-            'current_timestamp': current_time,
-            'seconds_since_update': current_time - manager.blacklist_last_update if manager.blacklist_last_update > 0 else 0,
-            'hours_since_update': (current_time - manager.blacklist_last_update) / 3600 if manager.blacklist_last_update > 0 else 0,
-            
-            # 更新逻辑
-            'should_update': manager._should_update_blacklist(),
-            'never_updated': manager.blacklist_last_update == 0,
-            
-            # 文件状态
-            'cache_files': {
-                'blacklist_exists': os.path.exists(manager.blacklist_cache_file),
-                'meta_exists': os.path.exists(manager.blacklist_meta_file),
-                'blacklist_path': manager.blacklist_cache_file,
-                'meta_path': manager.blacklist_meta_file
-            },
-            
-            # 监控状态
-            'monitoring_enabled': country_monitor.is_monitoring if country_monitor else False
-        }
-        
-        # 添加格式化时间
-        if manager.blacklist_last_update > 0:
-            debug_info['last_update_formatted'] = datetime.fromtimestamp(
-                manager.blacklist_last_update
-            ).strftime('%Y-%m-%d %H:%M:%S')
-        else:
-            debug_info['last_update_formatted'] = '从未更新'
-        
-        # 添加元数据信息
-        try:
-            meta_info = manager._load_blacklist_meta()
-            debug_info['metadata'] = meta_info
-        except Exception as e:
-            debug_info['metadata_error'] = str(e)
-        
-        # 文件详细信息
-        if os.path.exists(manager.blacklist_cache_file):
-            try:
-                stat = os.stat(manager.blacklist_cache_file)
-                debug_info['cache_file_info'] = {
-                    'size_bytes': stat.st_size,
-                    'modified_time': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
-                    'age_hours': (current_time - stat.st_mtime) / 3600
-                }
-            except Exception as e:
-                debug_info['cache_file_error'] = str(e)
-        
-        return jsonify({
-            'success': True,
-            'data': debug_info
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-def run_flask_app(port=5000):
-    """运行Flask应用"""
-    try:
-        logging.info(f"🌐 启动 Web 管理界面: http://0.0.0.0:{port}")
-        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
-    except Exception as e:
-        logging.error(f"❌ Flask应用启动失败: {e}")
-
-async def start_socks_server():
-    """启动 SOCKS5 服务器"""
-    global socks_server
-    try:
-        config = load_simple_config()
-        port = int(config.get('port', 1080))
-        
-        socks_server = SOCKS5Server('0.0.0.0', port)
-        await socks_server.start()
-    except Exception as e:
-        logging.error(f"❌ SOCKS5 服务器启动失败: {e}")
-
-def signal_handler(signum, frame):
-    """信号处理器"""
-    logging.info("🛑 接收到停止信号，正在关闭服务器...")
-    
-    if socks_server:
-        try:
-            if main_loop and main_loop.is_running():
-                asyncio.run_coroutine_threadsafe(socks_server.stop(), main_loop)
-        except:
-            pass
-    
-    if country_monitor:
-        country_monitor.stop_monitoring()
-    
-    sys.exit(0)
-
-async def main():
-    """主函数"""
-    global proxy_stats, country_monitor, main_loop
-    
-    # 获取当前事件循环
-    main_loop = asyncio.get_running_loop()
-    
-    # 创建必要的目录
-    os.makedirs('config', exist_ok=True)
-    os.makedirs('logs', exist_ok=True)
-    os.makedirs('modules', exist_ok=True)
-    
-    # 检查并创建 modules/__init__.py
-    init_file = os.path.join('modules', '__init__.py')
-    if not os.path.exists(init_file):
-        with open(init_file, 'w', encoding='utf-8') as f:
-            f.write('"""ProxyCat 模块包初始化文件"""\n')
-    
-    # 设置信号处理
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    # 加载配置
-    config = load_simple_config()
-    proxy_stats.update({
-        'target_country': config.get('target_country', 'US'),
-        'mode': config.get('mode', 'country'),
-        'language': config.get('language', 'cn'),
-        'use_getip': config.get('use_getip', 'True').lower() == 'true',
-        'port': int(config.get('port', '1080')),
-        'web_port': int(config.get('web_port', '5000'))
-    })
-    
-    # 初始化国家监控
-    country_monitor = init_country_monitor()
-    
-    # 打印启动信息
-    print("\n" + "="*70)
-    print("🐱 ProxyCat - 智能代理池管理系统 (完全修复版)")
-    print("="*70)
-    print(f"🚀 SOCKS5 代理端口: {proxy_stats['port']}")
-    print(f"🌐 Web 管理界面: http://localhost:{proxy_stats['web_port']}")
-    print(f"🎯 目标国家: {proxy_stats['target_country']}")
-    print(f"🤖 自动监控间隔: {country_monitor.check_interval}秒")
-    
-    # 显示黑名单状态
-    if country_monitor and hasattr(country_monitor, 'get_blacklist_stats'):
-        try:
-            blacklist_stats = country_monitor.get_blacklist_stats()
-            if blacklist_stats['enabled']:
-                if blacklist_stats['loaded']:
-                    source_text = {
-                        'local': '本地缓存',
-                        'remote': '远程下载',
-                        'remote_sync': '远程同步',
-                        'remote_async': '远程异步'
-                    }.get(blacklist_stats['source'], '未知')
-                    
-                    print(f"🛡️  IP黑名单: ✅ 已加载 ({blacklist_stats['size']} 条记录, 来源: {source_text})")
-                    
-                    if blacklist_stats['needs_update']:
-                        print("⏰ 黑名单将在后台自动更新")
-                    else:
-                        hours_old = blacklist_stats['hours_since_update']
-                        print(f"📅 黑名单状态: 最新 (上次更新: {hours_old:.1f}小时前)")
-                else:
-                    print("🛡️  IP黑名单: ❌ 加载失败")
-            else:
-                print("🛡️  IP黑名单: 🚫 功能已禁用")
-        except Exception as e:
-            print("🛡️  IP黑名单: ⚠️ 状态检查失败")
-            logging.debug(f"黑名单状态检查失败: {e}")
-    else:
-        print("🛡️  IP黑名单: ⚠️ 功能不可用")
-    
-    print("="*70)
-    
-    # 检查 getip 模块
-    getip_func = safe_import_getip()
-    if getip_func:
-        print("✅ getip 模块加载成功")
-    else:
-        print("❌ getip 模块加载失败")
-        print("   请确保 modules/getip.py 文件存在且配置正确")
-    
-    print("="*70)
-    print("💡 使用提示:")
-    print("   1. 访问 Web 界面启动自动监控")
-    print("   2. 黑名单定时更新已修复，每5分钟检查一次")
-    print("   3. 强制更新功能已修复，Web界面按钮正常工作")
-    print("   4. 添加了详细调试信息，可通过 /api/blacklist/debug 查看")
-    print("="*70)
-    
-    # 启动Flask应用（在单独线程中）
-    flask_thread = threading.Thread(
-        target=run_flask_app, 
-        args=(proxy_stats['web_port'],), 
-        daemon=True
-    )
-    flask_thread.start()
-    
-    # 等待Flask启动
-    await asyncio.sleep(2)
-    
-    # 启动 SOCKS5 服务器（主线程）
-    try:
-        await start_socks_server()
-    except KeyboardInterrupt:
-        logging.info("🛑 接收到中断信号")
-    except Exception as e:
-        logging.error(f"❌ 程序运行错误: {e}")
-    finally:
-        if socks_server:
-            await socks_server.stop()
-        if country_monitor:
-            country_monitor.stop_monitoring()
-
-if __name__ == '__main__':
-    # 设置日志
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler('logs/proxycat.log', encoding='utf-8')
-        ]
-    )
-    
-    # 运行主函数
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n🛑 程序已退出")
-    except Exception as e:
-        logging.error(f"❌ 程序启动失败: {e}")
-        import traceback
-        traceback.print_exc()
                 try:
                     data = json.loads(result.stdout)
                     country = data.get('country')
@@ -1164,7 +628,7 @@ class SOCKS5Server:
             if '://' in proxy_url:
                 proxy_url = proxy_url.split('://', 1)[1]
             
-                        if '@' in proxy_url:
+            if '@' in proxy_url:
                 auth_part, addr_part = proxy_url.split('@', 1)
                 username, password = auth_part.split(':', 1)
                 host, port = addr_part.split(':', 1)
@@ -1927,6 +1391,567 @@ def get_proxy_stats():
             'error': str(e)
         }), 500
 
+@app.route('/api/proxy/test', methods=['POST'])
+def test_proxy():
+    """测试当前代理"""
+    try:
+        if not current_proxy:
+            return jsonify({
+                'success': False,
+                'error': '当前没有设置代理'
+            })
+        
+        proxy_for_curl = current_proxy
+        if proxy_for_curl.startswith('socks5://'):
+            proxy_for_curl = proxy_for_curl[9:]
+        
+        cmd = [
+            'curl', '-s', '--connect-timeout', '10', '--max-time', '15',
+            '-x', f'socks5://{proxy_for_curl}',
+            'https://ipinfo.io?token=2247bca03780c6'
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        
+        if result.returncode == 0:
+            try:
+                data = json.loads(result.stdout)
+                ip = data.get('ip', 'Unknown')
+                country = data.get('country', 'Unknown')
+                
+                proxy_stats['current_country'] = country
+                
+                logging.info(f"✅ 代理测试成功: IP={ip}, 国家={country}")
+                return jsonify({
+                    'success': True,
+                    'ip': ip,
+                    'country': country,
+                    'full_info': data
+                })
+            except json.JSONDecodeError:
+                return jsonify({
+                    'success': False,
+                    'error': 'IP检测服务返回无效数据'
+                })
+        else:
+            error_msg = result.stderr or '代理连接失败'
+            logging.error(f"❌ 代理测试失败: {error_msg}")
+            return jsonify({
+                'success': False,
+                'error': error_msg
+            })
+            
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            'success': False,
+            'error': '代理测试超时'
+        })
+    except Exception as e:
+        logging.error(f"❌ 代理测试异常: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/proxy/country', methods=['GET', 'POST'])
+def manage_target_country():
+    global proxy_stats, country_monitor
+    
+    if request.method == 'GET':
+        try:
+            return jsonify({
+                'success': True,
+                'target_country': proxy_stats['target_country']
+            })
+        except Exception as e:
+            return jsonify({
+                'success': False,
+                'error': str(e)
+            }), 500
+    
+    elif request.method == 'POST':
+        try:
+            data = request.get_json()
+            country = data.get('country', '').strip().upper()
+            
+            if len(country) != 2:
+                return jsonify({
+                    'success': False,
+                    'error': '国家代码必须是2位字母'
+                }), 400
+            
+            proxy_stats['target_country'] = country
+            
+            if country_monitor:
+                country_monitor.target_country = country
+                logging.info(f"🎯 监控器目标国家已更新为: {country}")
+            
+            logging.info(f"🎯 目标国家已设置为: {country}")
+            
+            return jsonify({
+                'success': True,
+                'message': f'目标国家已设置为: {country}'
+            })
+        except Exception as e:
+            logging.error(f"❌ 设置目标国家失败: {e}")
+            return jsonify({
+                'success': False,
+                'error': str(e)
+            }), 500
+
+@app.route('/api/monitor/start', methods=['POST'])
+def start_country_monitoring():
+    """启动自动国家监控"""
+    global country_monitor, main_loop
+    
+    try:
+        if not country_monitor:
+            country_monitor = init_country_monitor()
+        
+        if country_monitor.is_monitoring:
+            return jsonify({
+                'success': False,
+                'message': '监控已在运行中'
+            })
+        
+        # 在主事件循环中启动监控
+        if main_loop and main_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(
+                country_monitor.start_monitoring(), 
+                main_loop
+            )
+            # 不等待完成，让它在后台运行
+            
+            return jsonify({
+                'success': True,
+                'message': '自动国家监控已启动',
+                'target_country': country_monitor.target_country,
+                'check_interval': country_monitor.check_interval
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': '主事件循环不可用'
+            }), 500
+        
+    except Exception as e:
+        logging.error(f"❌ 启动监控失败: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/monitor/stop', methods=['POST'])
+def stop_country_monitoring():
+    """停止自动国家监控"""
+    global country_monitor
+    
+    try:
+        if country_monitor and country_monitor.is_monitoring:
+            country_monitor.stop_monitoring()
+            return jsonify({
+                'success': True,
+                'message': '自动国家监控已停止'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'message': '监控未在运行'
+            })
+            
+    except Exception as e:
+        logging.error(f"❌ 停止监控失败: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/monitor/status')
+def get_monitor_status():
+    """获取监控状态"""
+    global country_monitor
+    
+    try:
+        if country_monitor:
+            monitor_stats = country_monitor.get_stats()
+            return jsonify({
+                'success': True,
+                'data': monitor_stats
+            })
+        else:
+            return jsonify({
+                'success': True,
+                'data': {
+                    'is_monitoring': False,
+                    'target_country': proxy_stats.get('target_country', 'US'),
+                    'check_interval': 60,
+                    'last_check_time': None,
+                    'last_country': None,
+                    'consecutive_failures': 0
+                }
+            })
+            
+    except Exception as e:
+        logging.error(f"❌ 获取监控状态失败: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/blacklist/status')
+def get_blacklist_status():
+    """获取黑名单详细状态"""
+    try:
+        if country_monitor and hasattr(country_monitor, 'get_blacklist_stats'):
+            blacklist_stats = country_monitor.get_blacklist_stats()
+            return jsonify({
+                'success': True,
+                'data': blacklist_stats
+            })
+        else:
+            return jsonify({
+                'success': True,
+                'data': {
+                    'enabled': False,
+                    'loaded': False,
+                    'size': 0,
+                    'source': 'not_available',
+                    'needs_update': False
+                }
+            })
+    except Exception as e:
+        logging.error(f"❌ 获取黑名单状态失败: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/blacklist/update', methods=['POST'])
+def force_update_blacklist():
+    """强制更新黑名单 - 最终修复版"""
+    try:
+        if not country_monitor or not hasattr(country_monitor, 'proxy_manager'):
+            return jsonify({
+                'success': False,
+                'error': '黑名单功能不可用'
+            }), 400
+        
+        proxy_manager = country_monitor.proxy_manager
+        if not proxy_manager:
+            return jsonify({
+                'success': False,
+                'error': '黑名单管理器未初始化'
+            }), 400
+            
+        if not getattr(proxy_manager, 'enable_blacklist', False):
+            return jsonify({
+                'success': False,
+                'error': '黑名单功能已禁用'
+            }), 400
+        
+        try:
+            logging.info("🔄 Web界面触发黑名单强制更新...")
+            
+            # 记录更新前状态
+            old_size = len(proxy_manager.ip_blacklist)
+            old_update_time = proxy_manager.blacklist_last_update
+            
+            # 重置更新时间，强制更新
+            proxy_manager.blacklist_last_update = 0
+            
+            # 执行同步下载
+            success = proxy_manager._sync_download_blacklist()
+            
+            if success:
+                new_size = len(proxy_manager.ip_blacklist)
+                logging.info(f"✅ Web界面黑名单强制更新成功: {old_size} -> {new_size} 条记录")
+                
+                return jsonify({
+                    'success': True,
+                    'message': f'黑名单强制更新成功，从 {old_size} 更新到 {new_size} 条记录',
+                    'old_size': old_size,
+                    'new_size': new_size
+                })
+            else:
+                # 恢复原时间
+                proxy_manager.blacklist_last_update = old_update_time
+                logging.error("❌ Web界面黑名单强制更新失败")
+                
+                return jsonify({
+                    'success': False,
+                    'error': '黑名单下载失败，请检查网络连接和URL配置'
+                })
+                
+        except Exception as e:
+            logging.error(f"❌ 黑名单强制更新异常: {e}")
+            return jsonify({
+                'success': False,
+                'error': f'更新异常: {str(e)}'
+            })
+        
+    except Exception as e:
+        logging.error(f"❌ 强制更新黑名单路由失败: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/blacklist/debug')
+def debug_blacklist():
+    """调试黑名单状态 - 详细信息"""
+    try:
+        if not country_monitor or not country_monitor.proxy_manager:
+            return jsonify({
+                'success': False,
+                'error': '黑名单管理器不可用'
+            })
+        
+        manager = country_monitor.proxy_manager
+        current_time = time.time()
+        
+        debug_info = {
+            # 基本状态
+            'enabled': manager.enable_blacklist,
+            'loaded': manager.blacklist_loaded,
+            'size': len(manager.ip_blacklist),
+            'url': manager.blacklist_url,
+            
+            # 时间相关
+            'update_interval_seconds': manager.blacklist_update_interval,
+            'update_interval_hours': manager.blacklist_update_interval / 3600,
+            'last_update_timestamp': manager.blacklist_last_update,
+            'current_timestamp': current_time,
+            'seconds_since_update': current_time - manager.blacklist_last_update if manager.blacklist_last_update > 0 else 0,
+            'hours_since_update': (current_time - manager.blacklist_last_update) / 3600 if manager.blacklist_last_update > 0 else 0,
+            
+            # 更新逻辑
+            'should_update': manager._should_update_blacklist(),
+            'never_updated': manager.blacklist_last_update == 0,
+            
+            # 文件状态
+            'cache_files': {
+                'blacklist_exists': os.path.exists(manager.blacklist_cache_file),
+                'meta_exists': os.path.exists(manager.blacklist_meta_file),
+                'blacklist_path': manager.blacklist_cache_file,
+                'meta_path': manager.blacklist_meta_file
+            },
+            
+            # 监控状态
+            'monitoring_enabled': country_monitor.is_monitoring if country_monitor else False
+        }
+        
+        # 添加格式化时间
+        if manager.blacklist_last_update > 0:
+            debug_info['last_update_formatted'] = datetime.fromtimestamp(
+                manager.blacklist_last_update
+            ).strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            debug_info['last_update_formatted'] = '从未更新'
+        
+        # 添加元数据信息
+        try:
+            meta_info = manager._load_blacklist_meta()
+            debug_info['metadata'] = meta_info
+        except Exception as e:
+            debug_info['metadata_error'] = str(e)
+        
+        # 文件详细信息
+        if os.path.exists(manager.blacklist_cache_file):
+            try:
+                stat = os.stat(manager.blacklist_cache_file)
+                debug_info['cache_file_info'] = {
+                    'size_bytes': stat.st_size,
+                    'modified_time': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
+                    'age_hours': (current_time - stat.st_mtime) / 3600
+                }
+            except Exception as e:
+                debug_info['cache_file_error'] = str(e)
+        
+        return jsonify({
+            'success': True,
+            'data': debug_info
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+def run_flask_app(port=5000):
+    """运行Flask应用"""
+    try:
+        logging.info(f"🌐 启动 Web 管理界面: http://0.0.0.0:{port}")
+        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    except Exception as e:
+        logging.error(f"❌ Flask应用启动失败: {e}")
+
+async def start_socks_server():
+    """启动 SOCKS5 服务器"""
+    global socks_server
+    try:
+        config = load_simple_config()
+        port = int(config.get('port', 1080))
+        
+        socks_server = SOCKS5Server('0.0.0.0', port)
+        await socks_server.start()
+    except Exception as e:
+        logging.error(f"❌ SOCKS5 服务器启动失败: {e}")
+
+def signal_handler(signum, frame):
+    """信号处理器"""
+    logging.info("🛑 接收到停止信号，正在关闭服务器...")
+    
+    if socks_server:
+        try:
+            if main_loop and main_loop.is_running():
+                asyncio.run_coroutine_threadsafe(socks_server.stop(), main_loop)
+        except:
+            pass
+    
+    if country_monitor:
+        country_monitor.stop_monitoring()
+    
+    sys.exit(0)
+
+async def main():
+    """主函数"""
+    global proxy_stats, country_monitor, main_loop
+    
+    # 获取当前事件循环
+    main_loop = asyncio.get_running_loop()
+    
+    # 创建必要的目录
+    os.makedirs('config', exist_ok=True)
+    os.makedirs('logs', exist_ok=True)
+    os.makedirs('modules', exist_ok=True)
+    
+    # 检查并创建 modules/__init__.py
+    init_file = os.path.join('modules', '__init__.py')
+    if not os.path.exists(init_file):
+        with open(init_file, 'w', encoding='utf-8') as f:
+            f.write('"""ProxyCat 模块包初始化文件"""\n')
+    
+    # 设置信号处理
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # 加载配置
+    config = load_simple_config()
+    proxy_stats.update({
+        'target_country': config.get('target_country', 'US'),
+        'mode': config.get('mode', 'country'),
+        'language': config.get('language', 'cn'),
+        'use_getip': config.get('use_getip', 'True').lower() == 'true',
+        'port': int(config.get('port', '1080')),
+        'web_port': int(config.get('web_port', '5000'))
+    })
+    
+    # 初始化国家监控
+    country_monitor = init_country_monitor()
+    
+    # 打印启动信息
+    print("\n" + "="*70)
+    print("🐱 ProxyCat - 智能代理池管理系统 (完全修复版)")
+    print("="*70)
+    print(f"🚀 SOCKS5 代理端口: {proxy_stats['port']}")
+    print(f"🌐 Web 管理界面: http://localhost:{proxy_stats['web_port']}")
+    print(f"🎯 目标国家: {proxy_stats['target_country']}")
+    print(f"🤖 自动监控间隔: {country_monitor.check_interval}秒")
+    
+    # 显示黑名单状态
+    if country_monitor and hasattr(country_monitor, 'get_blacklist_stats'):
+        try:
+            blacklist_stats = country_monitor.get_blacklist_stats()
+            if blacklist_stats['enabled']:
+                if blacklist_stats['loaded']:
+                    source_text = {
+                        'local': '本地缓存',
+                        'remote': '远程下载',
+                        'remote_sync': '远程同步',
+                        'remote_async': '远程异步'
+                    }.get(blacklist_stats['source'], '未知')
+                    
+                    print(f"🛡️  IP黑名单: ✅ 已加载 ({blacklist_stats['size']} 条记录, 来源: {source_text})")
+                    
+                    if blacklist_stats['needs_update']:
+                        print("⏰ 黑名单将在后台自动更新")
+                    else:
+                        hours_old = blacklist_stats['hours_since_update']
+                        print(f"📅 黑名单状态: 最新 (上次更新: {hours_old:.1f}小时前)")
+                else:
+                    print("🛡️  IP黑名单: ❌ 加载失败")
+            else:
+                print("🛡️  IP黑名单: 🚫 功能已禁用")
+        except Exception as e:
+            print("🛡️  IP黑名单: ⚠️ 状态检查失败")
+            logging.debug(f"黑名单状态检查失败: {e}")
+    else:
+        print("🛡️  IP黑名单: ⚠️ 功能不可用")
+    
+    print("="*70)
+    
+    # 检查 getip 模块
+    getip_func = safe_import_getip()
+    if getip_func:
+        print("✅ getip 模块加载成功")
+    else:
+        print("❌ getip 模块加载失败")
+        print("   请确保 modules/getip.py 文件存在且配置正确")
+    
+    print("="*70)
+    print("💡 使用提示:")
+    print("   1. 访问 Web 界面启动自动监控")
+    print("   2. 黑名单定时更新已修复，每5分钟检查一次")
+    print("   3. 强制更新功能已修复，Web界面按钮正常工作")
+    print("   4. 添加了详细调试信息，可通过 /api/blacklist/debug 查看")
+    print("="*70)
+    
+    # 启动Flask应用（在单独线程中）
+    flask_thread = threading.Thread(
+        target=run_flask_app, 
+        args=(proxy_stats['web_port'],), 
+        daemon=True
+    )
+    flask_thread.start()
+    
+    # 等待Flask启动
+    await asyncio.sleep(2)
+    
+    # 启动 SOCKS5 服务器（主线程）
+    try:
+        await start_socks_server()
+    except KeyboardInterrupt:
+        logging.info("🛑 接收到中断信号")
+    except Exception as e:
+        logging.error(f"❌ 程序运行错误: {e}")
+    finally:
+        if socks_server:
+            await socks_server.stop()
+        if country_monitor:
+            country_monitor.stop_monitoring()
+
+if __name__ == '__main__':
+    # 设置日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('logs/proxycat.log', encoding='utf-8')
+        ]
+    )
+    
+    # 运行主函数
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 程序已退出")
+    except Exception as e:
+        logging.error(f"❌ 程序启动失败: {e}")
+        import traceback
+        traceback.print_exc()
+
 @app.route('/api/proxy/switch', methods=['POST'])
 def manual_switch():
     global current_proxy, proxy_stats
@@ -1967,28 +1992,4 @@ def manual_switch():
         return jsonify({
             'success': False,
             'error': str(e)
-        }), 500
-
-@app.route('/api/proxy/test', methods=['POST'])
-def test_proxy():
-    """测试当前代理"""
-    try:
-        if not current_proxy:
-            return jsonify({
-                'success': False,
-                'error': '当前没有设置代理'
-            })
-        
-        proxy_for_curl = current_proxy
-        if proxy_for_curl.startswith('socks5://'):
-            proxy_for_curl = proxy_for_curl[9:]
-        
-        cmd = [
-            'curl', '-s', '--connect-timeout', '10', '--max-time', '15',
-            '-x', f'socks5://{proxy_for_curl}',
-            'https://ipinfo.io?token=2247bca03780c6'
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-        
-        if result.returncode == 0:
+        }),
