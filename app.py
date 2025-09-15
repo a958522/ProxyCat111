@@ -7,7 +7,7 @@ def init_country_monitor():
     
     # 传递完整配置给CountryMonitor，启用黑名单功能
     country_monitor = CountryMonitor(target_country, check_interval, config)
-    return country_monitorconfig.get('country_check_interval', '60'))
+    return country_monitorconfig.get('country_check_interval', '60')
     
     # 传递完整配置给CountryMonitor，启用黑名单功能
     country_monitor = CountryMonitor(target_country, check_interval, config)
