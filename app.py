@@ -1,693 +1,308 @@
-def init_country_monitor():
-    """初始化国家监控"""
-    global country_monitor
-    config = load_simple_config()
-    target_country = config.get('target_country', 'US')
-    check_interval = int(config.get('country_check_interval', '60'))
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+ProxyCat 最终版本 - 修复黑名单定时更新和强制更新问题
+"""
+
+import asyncio
+import socket
+import struct
+import threading
+import logging
+import os
+import sys
+import json
+import time
+import signal
+import importlib.util
+import subprocess
+from datetime import datetime
+from flask import Flask, request, jsonify, render_template_string
+from concurrent.futures import ThreadPoolExecutor
+
+# 添加当前目录到Python路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, current_dir)
+
+# 🔧 修复：确保 Flask 应用在所有路由定义之前创建
+app = Flask(__name__)
+flask_app = app  # 创建别名，保持兼容性
+
+# 全局变量
+current_proxy = None
+socks_server = None
+country_monitor = None
+main_loop = None  # 主事件循环
+executor = ThreadPoolExecutor(max_workers=4)  # 线程池
+
+proxy_stats = {
+    'current_proxy': None,
+    'current_country': None,
+    'total_checks': 0,
+    'proxy_switches': 0,
+    'country_changes': 0,
+    'blacklist_hits': 0,
+    'blacklist_size': 0,
+    'target_country': 'US',
+    'mode': 'country',
+    'language': 'cn',
+    'use_getip': True,
+    'port': 1080,
+    'web_port': 5000,
+    'connections_count': 0,
+    'bytes_transferred': 0
+}
+
+def load_simple_config():
+    """加载简化配置"""
+    config_path = os.path.join(current_dir, 'config', 'config.ini')
+    config = {
+        'mode': 'country',
+        'target_country': 'US',
+        'language': 'cn',
+        'use_getip': 'True',
+        'port': '1080',
+        'web_port': '5000',
+        'getip_url': '',
+        'buy_url_template': '',
+        'proxy_username': '',
+        'proxy_password': '',
+        'country_check_interval': '60',
+        'ip_blacklist_url': '',
+        'enable_ip_blacklist': 'True',
+        'blacklist_update_interval': '86400'
+    }
     
-    # 传递完整配置给CountryMonitor，启用黑名单功能
-    country_monitor = CountryMonitor(target_country, check_interval, config)
-    return country_monitorconfig.get('country_check_interval', '60')
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip()
+                        config[key] = value
+        except Exception as e:
+            logging.error(f"读取配置文件失败: {e}")
     
-    # 传递完整配置给CountryMonitor，启用黑名单功能
-    country_monitor = CountryMonitor(target_country, check_interval, config)
-    return country_monitor
+    return config
 
-# HTML 模板（增强版 - 包含黑名单功能）
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ProxyCat - 智能代理管理</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: 15px;
-            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
-            overflow: hidden;
-        }
-        .header {
-            background: linear-gradient(45deg, #2c3e50, #3498db);
-            color: white;
-            padding: 30px;
-            text-align: center;
-        }
-        .header h1 { font-size: 2.5em; margin-bottom: 10px; }
-        .status-banner {
-            background: #27ae60;
-            color: white;
-            padding: 15px;
-            text-align: center;
-            font-weight: bold;
-        }
-        .monitoring-status {
-            padding: 12px;
-            text-align: center;
-            font-weight: 500;
-            background: #3498db;
-            color: white;
-        }
-        .monitoring-status.active { background: #27ae60; }
-        .monitoring-status.inactive { background: #e74c3c; }
-        .main-content { padding: 30px; }
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-            gap: 15px;
-            margin-bottom: 25px;
-        }
-        .stat-card {
-            background: white;
-            border-radius: 10px;
-            padding: 15px;
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.08);
-            border-left: 4px solid #3498db;
-            text-align: center;
-            transition: transform 0.2s;
-        }
-        .stat-card:hover { transform: translateY(-2px); }
-        .stat-card.blacklist { border-left-color: #e74c3c; }
-        .stat-value {
-            font-size: 1.4em;
-            font-weight: bold;
-            margin-bottom: 5px;
-            color: #2c3e50;
-        }
-        .stat-label { color: #666; font-size: 0.85em; }
-        .control-panel {
-            background: white;
-            border-radius: 10px;
-            padding: 25px;
-            margin-bottom: 20px;
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.08);
-        }
-        .control-panel h3 {
-            margin-bottom: 20px;
-            color: #2c3e50;
-            border-bottom: 2px solid #ecf0f1;
-            padding-bottom: 10px;
-        }
-        .btn {
-            background: #3498db;
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 13px;
-            margin: 3px;
-            transition: all 0.3s;
-            font-weight: 500;
-        }
-        .btn:hover { background: #2980b9; transform: translateY(-1px); }
-        .btn.success { background: #27ae60; }
-        .btn.success:hover { background: #229954; }
-        .btn.warning { background: #f39c12; }
-        .btn.warning:hover { background: #e67e22; }
-        .btn.danger { background: #e74c3c; }
-        .btn.danger:hover { background: #c0392b; }
-        .btn:disabled { background: #95a5a6; cursor: not-allowed; transform: none; }
-        .input-field {
-            padding: 8px 12px;
-            border: 2px solid #ecf0f1;
-            border-radius: 6px;
-            font-size: 13px;
-            margin: 3px;
-            transition: border-color 0.3s;
-        }
-        .input-field:focus { border-color: #3498db; outline: none; }
-        .proxy-info {
-            background: #f8f9fa;
-            border: 1px solid #dee2e6;
-            border-radius: 8px;
-            padding: 12px;
-            margin: 10px 0;
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
-            word-break: break-all;
-        }
-        .monitor-info {
-            background: #e3f2fd;
-            border: 1px solid #90caf9;
-            border-radius: 8px;
-            padding: 12px;
-            margin: 10px 0;
-            font-size: 13px;
-            line-height: 1.4;
-        }
-        .blacklist-info {
-            background: #fff3e0;
-            border: 1px solid #ffb74d;
-            border-radius: 8px;
-            padding: 12px;
-            margin: 10px 0;
-            font-size: 13px;
-            line-height: 1.4;
-        }
-        .alert {
-            padding: 15px;
-            border-radius: 5px;
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            z-index: 9999;
-            min-width: 300px;
-            animation: slideIn 0.3s ease;
-        }
-        @keyframes slideIn {
-            from { transform: translateX(100%); opacity: 0; }
-            to { transform: translateX(0); opacity: 1; }
-        }
-        .alert.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .alert.error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        .alert.warning { background: #fff3cd; color: #856404; border: 1px solid #ffeaa7; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🐱 ProxyCat</h1>
-            <p>智能代理池管理系统 - 自动国家监控版</p>
-        </div>
-        
-        <div class="status-banner">
-            🚀 SOCKS5 代理服务器运行中 - localhost:1080
-        </div>
-        
-        <div class="monitoring-status" id="monitoring-status">
-            🔍 监控状态检查中...
-        </div>
-        
-        <div class="main-content">
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-value" id="connections-count">0</div>
-                    <div class="stat-label">总连接数</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value" id="proxy-switches">0</div>
-                    <div class="stat-label">代理切换</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value" id="total-checks">0</div>
-                    <div class="stat-label">国家检测</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value" id="country-changes">0</div>
-                    <div class="stat-label">国家变化</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value" id="current-country">-</div>
-                    <div class="stat-label">当前国家</div>
-                </div>
-                <div class="stat-card blacklist">
-                    <div class="stat-value" id="blacklist-status">-</div>
-                    <div class="stat-label">黑名单状态</div>
-                </div>
-                <div class="stat-card blacklist">
-                    <div class="stat-value" id="blacklist-size">0</div>
-                    <div class="stat-label">黑名单大小</div>
-                </div>
-                <div class="stat-card blacklist">
-                    <div class="stat-value" id="blacklist-hits">0</div>
-                    <div class="stat-label">黑名单拦截</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value" id="bytes-transferred">0 B</div>
-                    <div class="stat-label">数据传输</div>
-                </div>
-            </div>
-            
-            <div class="control-panel">
-                <h3>🤖 自动国家监控</h3>
-                
-                <div class="monitor-info" id="monitor-info">
-                    监控信息加载中...
-                </div>
-                
-                <div style="margin-bottom: 15px;">
-                    <label>目标国家:</label>
-                    <input type="text" id="target-country-input" class="input-field" value="US" maxlength="2" style="width: 80px;">
-                    <button class="btn" onclick="updateTargetCountry()">🎯 更新</button>
-                </div>
-                
-                <div>
-                    <button class="btn success" id="start-monitor-btn" onclick="startMonitoring()">▶️ 启动监控</button>
-                    <button class="btn danger" id="stop-monitor-btn" onclick="stopMonitoring()">⏹️ 停止监控</button>
-                    <button class="btn" onclick="checkMonitorStatus()">📋 检查状态</button>
-                </div>
-            </div>
-            
-            <div class="control-panel">
-                <h3>🛡️ 黑名单管理</h3>
-                
-                <div class="blacklist-info" id="blacklist-info">
-                    黑名单信息加载中...
-                </div>
-                
-                <div>
-                    <button class="btn" onclick="checkBlacklistStatus()">📋 检查状态</button>
-                    <button class="btn warning" onclick="forceUpdateBlacklist()">🔄 强制更新</button>
-                </div>
-            </div>
-            
-            <div class="control-panel">
-                <h3>🎮 手动控制</h3>
-                
-                <div class="proxy-info">
-                    <strong>当前代理:</strong><br>
-                    <span id="current-proxy-display">未设置</span>
-                </div>
-                
-                <div>
-                    <button class="btn warning" onclick="manualSwitchProxy()">🔄 手动切换</button>
-                    <button class="btn" onclick="testProxy()">🧪 测试代理</button>
-                    <button class="btn" onclick="refreshStats()">📊 刷新统计</button>
-                </div>
-            </div>
-        </div>
-    </div>
-    
-    <div id="alert-container"></div>
-
-    <script>
-        let statsRefreshInterval;
-        
-        document.addEventListener('DOMContentLoaded', function() {
-            refreshStats();
-            checkMonitorStatus();
-            checkBlacklistStatus();
-            startAutoRefresh();
-        });
-        
-        function startAutoRefresh() {
-            statsRefreshInterval = setInterval(() => {
-                refreshStats();
-                checkMonitorStatus();
-            }, 3000);
-        }
-        
-        async function refreshStats() {
-            try {
-                const response = await fetch('/api/proxy/stats');
-                const data = await response.json();
-                
-                if (data.success) {
-                    updateStatsDisplay(data.data);
-                }
-            } catch (error) {
-                console.error('刷新统计失败:', error);
-            }
-        }
-        
-        async function checkMonitorStatus() {
-            try {
-                const response = await fetch('/api/monitor/status');
-                const data = await response.json();
-                
-                if (data.success) {
-                    updateMonitorStatus(data.data);
-                }
-            } catch (error) {
-                console.error('检查监控状态失败:', error);
-            }
-        }
-        
-        async function checkBlacklistStatus() {
-            try {
-                const response = await fetch('/api/blacklist/status');
-                const data = await response.json();
-                
-                if (data.success) {
-                    updateBlacklistInfo(data.data);
-                }
-            } catch (error) {
-                console.error('检查黑名单状态失败:', error);
-            }
-        }
-        
-        function updateStatsDisplay(stats) {
-            document.getElementById('connections-count').textContent = stats.connections_count || 0;
-            document.getElementById('proxy-switches').textContent = stats.proxy_switches || 0;
-            document.getElementById('total-checks').textContent = stats.total_checks || 0;
-            document.getElementById('country-changes').textContent = stats.country_changes || 0;
-            document.getElementById('current-country').textContent = stats.current_country || '-';
-            document.getElementById('blacklist-hits').textContent = stats.blacklist_hits || 0;
-            
-            const bytes = stats.bytes_transferred || 0;
-            let size = bytes < 1024 ? bytes + ' B' :
-                      bytes < 1024*1024 ? (bytes/1024).toFixed(1) + ' KB' :
-                      (bytes/1024/1024).toFixed(1) + ' MB';
-            document.getElementById('bytes-transferred').textContent = size;
-            
-            // 更新黑名单状态
-            const blacklistStatus = document.getElementById('blacklist-status');
-            const blacklistSize = document.getElementById('blacklist-size');
-            
-            if (stats.blacklist_enabled) {
-                if (stats.blacklist_loaded) {
-                    blacklistStatus.textContent = '✅ 已加载';
-                    blacklistStatus.style.color = '#27ae60';
-                } else {
-                    blacklistStatus.textContent = '❌ 失败';
-                    blacklistStatus.style.color = '#e74c3c';
-                }
-                blacklistSize.textContent = stats.blacklist_size || 0;
-            } else {
-                blacklistStatus.textContent = '🚫 禁用';
-                blacklistStatus.style.color = '#95a5a6';
-                blacklistSize.textContent = '0';
-            }
-            
-            // 更新代理显示
-            const proxyDisplay = document.getElementById('current-proxy-display');
-            if (stats.current_proxy) {
-                const displayProxy = stats.current_proxy.includes('@') ? 
-                    stats.current_proxy.split('@')[1] : stats.current_proxy;
-                proxyDisplay.textContent = displayProxy;
-                proxyDisplay.style.color = '#27ae60';
-            } else {
-                proxyDisplay.textContent = '未设置';
-                proxyDisplay.style.color = '#e74c3c';
-            }
-            
-            document.getElementById('target-country-input').value = stats.target_country || 'US';
-        }
-        
-        function updateMonitorStatus(monitorData) {
-            const statusEl = document.getElementById('monitoring-status');
-            const infoEl = document.getElementById('monitor-info');
-            const startBtn = document.getElementById('start-monitor-btn');
-            const stopBtn = document.getElementById('stop-monitor-btn');
-            
-            if (monitorData.is_monitoring) {
-                statusEl.textContent = '🤖 自动监控运行中';
-                statusEl.className = 'monitoring-status active';
-                startBtn.disabled = true;
-                stopBtn.disabled = false;
-            } else {
-                statusEl.textContent = '😴 自动监控已停止';
-                statusEl.className = 'monitoring-status inactive';
-                startBtn.disabled = false;
-                stopBtn.disabled = true;
-            }
-            
-            let infoHtml = `
-                <strong>目标国家:</strong> ${monitorData.target_country}<br>
-                <strong>检测间隔:</strong> ${monitorData.check_interval}秒<br>
-                <strong>上次检测:</strong> ${monitorData.last_check_time ? new Date(monitorData.last_check_time).toLocaleString() : '未检测'}<br>
-                <strong>连续失败:</strong> ${monitorData.consecutive_failures}次
-            `;
-            infoEl.innerHTML = infoHtml;
-        }
-        
-        function updateBlacklistInfo(blacklistData) {
-            const infoEl = document.getElementById('blacklist-info');
-            
-            if (!blacklistData.enabled) {
-                infoEl.innerHTML = '<strong>状态:</strong> 🚫 功能已禁用';
-                return;
-            }
-            
-            let statusText = blacklistData.loaded ? '✅ 已加载' : '❌ 未加载';
-            let sourceText = {
-                'local': '本地缓存',
-                'remote': '远程下载', 
-                'remote_sync': '远程同步',
-                'remote_async': '远程异步',
-                'empty': '空',
-                'disabled': '禁用',
-                'unknown': '未知'
-            }[blacklistData.source] || blacklistData.source;
-            
-            let updateText = blacklistData.needs_update ? '⏰ 需要更新' : '✅ 最新';
-            
-            let infoHtml = `
-                <strong>状态:</strong> ${statusText}<br>
-                <strong>大小:</strong> ${blacklistData.size} 条记录<br>
-                <strong>来源:</strong> ${sourceText}<br>
-                <strong>更新状态:</strong> ${updateText}<br>
-                <strong>上次更新:</strong> ${blacklistData.last_update ? 
-                    new Date(blacklistData.last_update).toLocaleString() : '从未更新'}<br>
-                <strong>缓存文件:</strong> ${blacklistData.cache_file_exists ? '✅ 存在' : '❌ 不存在'}<br>
-                <strong>更新间隔:</strong> ${blacklistData.update_interval_hours}小时
-            `;
-            
-            if (blacklistData.meta_info && blacklistData.meta_info.valid_count) {
-                infoHtml += `<br><strong>有效记录:</strong> ${blacklistData.meta_info.valid_count}`;
-                if (blacklistData.meta_info.invalid_count > 0) {
-                    infoHtml += ` (忽略 ${blacklistData.meta_info.invalid_count} 条无效记录)`;
-                }
-            }
-            
-            infoEl.innerHTML = infoHtml;
-        }
-        
-        async function startMonitoring() {
-            try {
-                showAlert('正在启动自动监控...', 'warning');
-                const response = await fetch('/api/monitor/start', { method: 'POST' });
-                const data = await response.json();
-                
-                if (data.success) {
-                    showAlert('自动监控已启动！', 'success');
-                    checkMonitorStatus();
-                } else {
-                    showAlert('启动失败: ' + data.message, 'error');
-                }
-            } catch (error) {
-                showAlert('启动失败: ' + error.message, 'error');
-            }
-        }
-        
-        async function stopMonitoring() {
-            try {
-                showAlert('正在停止自动监控...', 'warning');
-                const response = await fetch('/api/monitor/stop', { method: 'POST' });
-                const data = await response.json();
-                
-                if (data.success) {
-                    showAlert('自动监控已停止！', 'success');
-                    checkMonitorStatus();
-                } else {
-                    showAlert('停止失败: ' + data.message, 'error');
-                }
-            } catch (error) {
-                showAlert('停止失败: ' + error.message, 'error');
-            }
-        }
-        
-        async function manualSwitchProxy() {
-            try {
-                showAlert('正在切换代理...', 'warning');
-                const response = await fetch('/api/proxy/switch', { method: 'POST' });
-                const data = await response.json();
-                
-                if (data.success) {
-                    showAlert('代理切换成功！', 'success');
-                    refreshStats();
-                } else {
-                    showAlert('代理切换失败: ' + data.error, 'error');
-                }
-            } catch (error) {
-                showAlert('代理切换失败: ' + error.message, 'error');
-            }
-        }
-        
-        async function testProxy() {
-            try {
-                showAlert('正在测试代理...', 'warning');
-                const response = await fetch('/api/proxy/test', { method: 'POST' });
-                const data = await response.json();
-                
-                if (data.success) {
-                    showAlert(`代理测试成功！IP: ${data.ip}, 国家: ${data.country}`, 'success');
-                } else {
-                    showAlert('代理测试失败: ' + data.error, 'error');
-                }
-            } catch (error) {
-                showAlert('代理测试失败: ' + error.message, 'error');
-            }
-        }
-        
-        async function updateTargetCountry() {
-            const countryInput = document.getElementById('target-country-input');
-            const country = countryInput.value.trim().toUpperCase();
-            
-            if (country.length !== 2) {
-                showAlert('请输入2位国家代码', 'error');
-                return;
-            }
-            
-            try {
-                const response = await fetch('/api/proxy/country', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ country: country })
-                });
-                
-                const data = await response.json();
-                
-                if (data.success) {
-                    showAlert('目标国家更新成功！', 'success');
-                    refreshStats();
-                    checkMonitorStatus();
-                } else {
-                    showAlert('更新失败: ' + data.error, 'error');
-                }
-            } catch (error) {
-                showAlert('更新失败: ' + error.message, 'error');
-            }
-        }
-        
-        async function forceUpdateBlacklist() {
-            try {
-                showAlert('正在强制更新黑名单...', 'warning');
-                const response = await fetch('/api/blacklist/update', { method: 'POST' });
-                const data = await response.json();
-                
-                if (data.success) {
-                    showAlert('黑名单更新已启动！', 'success');
-                    // 5秒后检查状态
-                    setTimeout(() => {
-                        checkBlacklistStatus();
-                        refreshStats();
-                    }, 5000);
-                } else {
-                    showAlert('更新失败: ' + data.error, 'error');
-                }
-            } catch (error) {
-                showAlert('更新失败: ' + error.message, 'error');
-            }
-        }
-        
-        function showAlert(message, type) {
-            const alertContainer = document.getElementById('alert-container');
-            const alertDiv = document.createElement('div');
-            alertDiv.className = `alert ${type}`;
-            alertDiv.textContent = message;
-            
-            alertContainer.appendChild(alertDiv);
-            
-            setTimeout(() => {
-                if (alertDiv.parentNode) {
-                    alertDiv.parentNode.removeChild(alertDiv);
-                }
-            }, 4000);
-        }
-    </script>
-</body>
-</html>
-'''
-
-# Flask 路由
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/api/proxy/stats')
-def get_proxy_stats():
-    """获取增强的统计信息"""
+def safe_import_getip():
+    """安全导入 getip 模块"""
     try:
-        stats = dict(proxy_stats)
+        getip_path = os.path.join(current_dir, 'modules', 'getip.py')
+        if not os.path.exists(getip_path):
+            logging.error(f"getip.py 文件不存在: {getip_path}")
+            return None
         
-        if country_monitor:
-            monitor_stats = country_monitor.get_stats()
-            stats.update(monitor_stats)
-        else:
-            stats.update({
-                'is_monitoring': False,
-                'last_check_time': None,
-                'consecutive_failures': 0
-            })
+        # 动态导入 modules.modules（如果存在）
+        modules_path = os.path.join(current_dir, 'modules', 'modules.py')
+        if os.path.exists(modules_path):
+            modules_spec = importlib.util.spec_from_file_location("modules", modules_path)
+            modules_module = importlib.util.module_from_spec(modules_spec)
+            sys.modules['modules.modules'] = modules_module
+            modules_spec.loader.exec_module(modules_module)
         
-        return jsonify({
-            'success': True,
-            'data': stats
-        })
+        # 动态导入 getip
+        spec = importlib.util.spec_from_file_location("getip", getip_path)
+        getip_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(getip_module)
+        
+        logging.info("✅ getip 模块加载成功")
+        return getip_module.newip
+        
     except Exception as e:
-        logging.error(f"❌ 获取统计信息失败: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+        logging.error(f"❌ getip 模块加载失败: {e}")
+        return None
 
-@app.route('/api/proxy/switch', methods=['POST'])
-def manual_switch():
-    global current_proxy, proxy_stats
+def run_in_executor(func, *args):
+    """在线程池中运行同步函数"""
+    return executor.submit(func, *args)
+
+def schedule_coroutine(coro):
+    """在主事件循环中调度协程"""
+    if main_loop and main_loop.is_running():
+        future = asyncio.run_coroutine_threadsafe(coro, main_loop)
+        return future
+    else:
+        logging.error("❌ 主事件循环不可用")
+        return None
+
+class CountryMonitor:
+    """自动国家检测和代理切换系统 - 修复版"""
     
-    try:
-        newip_func = safe_import_getip()
-        if not newip_func:
-            return jsonify({
-                'success': False,
-                'error': 'getip 模块不可用，请检查配置'
-            }), 500
+    def __init__(self, target_country='US', check_interval=60, config=None):
+        self.target_country = target_country
+        self.check_interval = check_interval
+        self.is_monitoring = False
+        self.last_check_time = 0
+        self.last_country = None
+        self.consecutive_failures = 0
+        self.max_failures = 3
+        self.monitor_task = None
         
-        logging.info("🔄 手动切换代理...")
-        new_proxy = newip_func()
+        # 黑名单功能支持
+        self.config = config or {}
+        self.enable_blacklist = self.config.get('enable_ip_blacklist', 'True').lower() == 'true'
+        self.blacklist_url = self.config.get('ip_blacklist_url', '')
         
-        if new_proxy:
-            old_proxy = current_proxy
-            current_proxy = new_proxy
-            proxy_stats['current_proxy'] = new_proxy
-            proxy_stats['proxy_switches'] += 1
-            
-            logging.info(f"✅ 手动切换代理成功: {old_proxy} -> {new_proxy}")
-            return jsonify({
-                'success': True,
-                'message': '代理切换成功',
-                'old_proxy': old_proxy,
-                'new_proxy': new_proxy
-            })
+        # 初始化黑名单管理器
+        if self.enable_blacklist and self.blacklist_url:
+            try:
+                from modules.country_proxy_manager import CountryBasedProxyManager
+                self.proxy_manager = CountryBasedProxyManager(config or {})
+                logging.info("✅ 黑名单管理器初始化成功")
+            except Exception as e:
+                logging.error(f"❌ 黑名单管理器初始化失败: {e}")
+                self.proxy_manager = None
         else:
-            logging.error("❌ 获取新代理失败")
-            return jsonify({
-                'success': False,
-                'error': '无法获取新代理'
-            })
+            self.proxy_manager = None
+            if not self.enable_blacklist:
+                logging.info("🚫 IP黑名单功能已禁用")
+            elif not self.blacklist_url:
+                logging.warning("⚠️ 未配置黑名单URL，黑名单功能不可用")
+        
+    async def start_monitoring(self):
+        """启动自动监控"""
+        if self.is_monitoring:
+            logging.warning("⚠️ 国家监控已在运行中")
+            return
             
-    except Exception as e:
-        logging.error(f"❌ 手动切换代理失败: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-@app.route('/api/proxy/test', methods=['POST'])
-def test_proxy():
-    """测试当前代理"""
-    try:
+        self.is_monitoring = True
+        logging.info(f"🌍 启动自动国家监控 - 目标国家: {self.target_country}, 检测间隔: {self.check_interval}秒")
+        
+        # 创建监控任务
+        self.monitor_task = asyncio.create_task(self._monitoring_loop())
+        
+    async def _monitoring_loop(self):
+        """监控循环 - 增强版，包含黑名单定时更新"""
+        blacklist_check_interval = 300  # 5分钟检查一次黑名单
+        last_blacklist_check = 0
+        
+        while self.is_monitoring:
+            try:
+                current_time = time.time()
+                
+                # 🔧 新增：定时检查黑名单是否需要更新
+                if current_time - last_blacklist_check >= blacklist_check_interval:
+                    if self.proxy_manager and self.enable_blacklist:
+                        try:
+                            if self.proxy_manager._should_update_blacklist():
+                                logging.info("⏰ 监控循环检测到黑名单需要更新...")
+                                
+                                # 在线程池中执行同步更新
+                                loop = asyncio.get_event_loop()
+                                success = await loop.run_in_executor(
+                                    executor, 
+                                    self.proxy_manager._sync_download_blacklist
+                                )
+                                
+                                if success:
+                                    logging.info("✅ 监控循环中黑名单更新成功")
+                                else:
+                                    logging.warning("⚠️ 监控循环中黑名单更新失败")
+                            else:
+                                # 每小时记录一次状态
+                                hours_since_update = (current_time - self.proxy_manager.blacklist_last_update) / 3600 if self.proxy_manager.blacklist_last_update > 0 else 0
+                                if hours_since_update > 0 and int(hours_since_update) % 6 == 0:  # 每6小时记录一次
+                                    logging.debug(f"🛡️ 黑名单状态：距离上次更新 {hours_since_update:.1f} 小时，暂不需要更新")
+                        except Exception as e:
+                            logging.error(f"❌ 监控循环中黑名单检查异常: {e}")
+                    
+                    last_blacklist_check = current_time
+                
+                # 原有的代理国家检查
+                await self.check_and_switch_if_needed()
+                
+                await asyncio.sleep(self.check_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"❌ 监控循环异常: {e}")
+                await asyncio.sleep(10)
+    
+    def stop_monitoring(self):
+        """停止监控"""
+        self.is_monitoring = False
+        if self.monitor_task:
+            self.monitor_task.cancel()
+        logging.info("🛑 自动国家监控已停止")
+    
+    async def check_and_switch_if_needed(self):
+        """检查当前代理国家，必要时切换"""
+        global current_proxy, proxy_stats
+        
         if not current_proxy:
-            return jsonify({
-                'success': False,
-                'error': '当前没有设置代理'
-            })
+            logging.info("🔄 当前无代理，尝试获取新代理...")
+            await self.switch_proxy("无代理")
+            return
         
-        proxy_for_curl = current_proxy
-        if proxy_for_curl.startswith('socks5://'):
-            proxy_for_curl = proxy_for_curl[9:]
+        try:
+            # 使用原版的可靠检测方法（包含黑名单检查）
+            country = await self.detect_proxy_country(current_proxy)
+            
+            if country:
+                self.consecutive_failures = 0
+                proxy_stats['current_country'] = country
+                proxy_stats['total_checks'] += 1
+                self.last_check_time = time.time()
+                
+                if self.last_country != country:
+                    if self.last_country is not None:
+                        proxy_stats['country_changes'] += 1
+                        logging.info(f"🌍 检测到国家变化: {self.last_country} -> {country}")
+                    else:
+                        logging.info(f"🌍 首次检测到代理国家: {country}")
+                    
+                    self.last_country = country
+                
+                # 检查是否是黑名单IP
+                if country == 'BLACKLISTED':
+                    logging.warning("🚫 当前代理IP在黑名单中")
+                    proxy_stats['blacklist_hits'] += 1
+                    await self.switch_proxy("IP在黑名单中")
+                elif country != self.target_country:
+                    logging.warning(f"⚠️ 当前国家 {country} 不符合目标国家 {self.target_country}")
+                    await self.switch_proxy(f"国家不匹配 ({country} != {self.target_country})")
+                else:
+                    logging.info(f"✅ 代理国家检查通过: {country}")
+            
+            else:
+                self.consecutive_failures += 1
+                logging.error(f"❌ 代理国家检测失败 (连续失败 {self.consecutive_failures}/{self.max_failures})")
+                
+                if self.consecutive_failures >= self.max_failures:
+                    logging.error("❌ 连续检测失败次数过多，切换代理")
+                    await self.switch_proxy("连续检测失败")
+                    self.consecutive_failures = 0
         
-        cmd = [
-            'curl', '-s', '--connect-timeout', '10', '--max-time', '15',
-            '-x', f'socks5://{proxy_for_curl}',
-            'https://ipinfo.io?token=2247bca03780c6'
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-        
-        if result.returncode == 0:
+        except Exception as e:
+            logging.error(f"❌ 国家检测过程异常: {e}")
+            self.consecutive_failures += 1
+    
+    async def detect_proxy_country(self, proxy_url):
+        """检测代理的真实出口国家（集成黑名单检查）"""
+        try:
+            proxy_for_curl = proxy_url
+            if proxy_for_curl.startswith('socks5://'):
+                proxy_for_curl = proxy_for_curl[9:]
+            
+            cmd = [
+                'curl', '-s', '--connect-timeout', '10', '--max-time', '15',
+                '-x', f'socks5://{proxy_for_curl}',
+                'https://ipinfo.io?token=2247bca03780c6'
+            ]
+            
+            # 在线程池中运行subprocess
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                executor, 
+                lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            )
+            
+            if result.returncode == 0:
             try:
                 data = json.loads(result.stdout)
                 ip = data.get('ip', 'Unknown')
@@ -902,30 +517,151 @@ def get_blacklist_status():
 
 @app.route('/api/blacklist/update', methods=['POST'])
 def force_update_blacklist():
-    """强制更新黑名单"""
+    """强制更新黑名单 - 最终修复版"""
     try:
-        if not country_monitor or not hasattr(country_monitor, 'force_update_blacklist'):
+        if not country_monitor or not hasattr(country_monitor, 'proxy_manager'):
             return jsonify({
                 'success': False,
                 'error': '黑名单功能不可用'
             }), 400
         
-        if not getattr(country_monitor, 'enable_blacklist', False):
+        proxy_manager = country_monitor.proxy_manager
+        if not proxy_manager:
+            return jsonify({
+                'success': False,
+                'error': '黑名单管理器未初始化'
+            }), 400
+            
+        if not getattr(proxy_manager, 'enable_blacklist', False):
             return jsonify({
                 'success': False,
                 'error': '黑名单功能已禁用'
             }), 400
         
-        # 强制更新黑名单
-        task = country_monitor.force_update_blacklist()
+        try:
+            logging.info("🔄 Web界面触发黑名单强制更新...")
+            
+            # 记录更新前状态
+            old_size = len(proxy_manager.ip_blacklist)
+            old_update_time = proxy_manager.blacklist_last_update
+            
+            # 重置更新时间，强制更新
+            proxy_manager.blacklist_last_update = 0
+            
+            # 执行同步下载
+            success = proxy_manager._sync_download_blacklist()
+            
+            if success:
+                new_size = len(proxy_manager.ip_blacklist)
+                logging.info(f"✅ Web界面黑名单强制更新成功: {old_size} -> {new_size} 条记录")
+                
+                return jsonify({
+                    'success': True,
+                    'message': f'黑名单强制更新成功，从 {old_size} 更新到 {new_size} 条记录',
+                    'old_size': old_size,
+                    'new_size': new_size
+                })
+            else:
+                # 恢复原时间
+                proxy_manager.blacklist_last_update = old_update_time
+                logging.error("❌ Web界面黑名单强制更新失败")
+                
+                return jsonify({
+                    'success': False,
+                    'error': '黑名单下载失败，请检查网络连接和URL配置'
+                })
+                
+        except Exception as e:
+            logging.error(f"❌ 黑名单强制更新异常: {e}")
+            return jsonify({
+                'success': False,
+                'error': f'更新异常: {str(e)}'
+            })
+        
+    except Exception as e:
+        logging.error(f"❌ 强制更新黑名单路由失败: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/blacklist/debug')
+def debug_blacklist():
+    """调试黑名单状态 - 详细信息"""
+    try:
+        if not country_monitor or not country_monitor.proxy_manager:
+            return jsonify({
+                'success': False,
+                'error': '黑名单管理器不可用'
+            })
+        
+        manager = country_monitor.proxy_manager
+        current_time = time.time()
+        
+        debug_info = {
+            # 基本状态
+            'enabled': manager.enable_blacklist,
+            'loaded': manager.blacklist_loaded,
+            'size': len(manager.ip_blacklist),
+            'url': manager.blacklist_url,
+            
+            # 时间相关
+            'update_interval_seconds': manager.blacklist_update_interval,
+            'update_interval_hours': manager.blacklist_update_interval / 3600,
+            'last_update_timestamp': manager.blacklist_last_update,
+            'current_timestamp': current_time,
+            'seconds_since_update': current_time - manager.blacklist_last_update if manager.blacklist_last_update > 0 else 0,
+            'hours_since_update': (current_time - manager.blacklist_last_update) / 3600 if manager.blacklist_last_update > 0 else 0,
+            
+            # 更新逻辑
+            'should_update': manager._should_update_blacklist(),
+            'never_updated': manager.blacklist_last_update == 0,
+            
+            # 文件状态
+            'cache_files': {
+                'blacklist_exists': os.path.exists(manager.blacklist_cache_file),
+                'meta_exists': os.path.exists(manager.blacklist_meta_file),
+                'blacklist_path': manager.blacklist_cache_file,
+                'meta_path': manager.blacklist_meta_file
+            },
+            
+            # 监控状态
+            'monitoring_enabled': country_monitor.is_monitoring if country_monitor else False
+        }
+        
+        # 添加格式化时间
+        if manager.blacklist_last_update > 0:
+            debug_info['last_update_formatted'] = datetime.fromtimestamp(
+                manager.blacklist_last_update
+            ).strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            debug_info['last_update_formatted'] = '从未更新'
+        
+        # 添加元数据信息
+        try:
+            meta_info = manager._load_blacklist_meta()
+            debug_info['metadata'] = meta_info
+        except Exception as e:
+            debug_info['metadata_error'] = str(e)
+        
+        # 文件详细信息
+        if os.path.exists(manager.blacklist_cache_file):
+            try:
+                stat = os.stat(manager.blacklist_cache_file)
+                debug_info['cache_file_info'] = {
+                    'size_bytes': stat.st_size,
+                    'modified_time': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
+                    'age_hours': (current_time - stat.st_mtime) / 3600
+                }
+            except Exception as e:
+                debug_info['cache_file_error'] = str(e)
         
         return jsonify({
             'success': True,
-            'message': '黑名单更新已开始，请稍后查看状态'
+            'data': debug_info
         })
         
     except Exception as e:
-        logging.error(f"❌ 强制更新黑名单失败: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
@@ -935,7 +671,7 @@ def run_flask_app(port=5000):
     """运行Flask应用"""
     try:
         logging.info(f"🌐 启动 Web 管理界面: http://0.0.0.0:{port}")
-        flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
     except Exception as e:
         logging.error(f"❌ Flask应用启动失败: {e}")
 
@@ -1005,7 +741,7 @@ async def main():
     
     # 打印启动信息
     print("\n" + "="*70)
-    print("🐱 ProxyCat - 智能代理池管理系统 (修复版)")
+    print("🐱 ProxyCat - 智能代理池管理系统 (完全修复版)")
     print("="*70)
     print(f"🚀 SOCKS5 代理端口: {proxy_stats['port']}")
     print(f"🌐 Web 管理界面: http://localhost:{proxy_stats['web_port']}")
@@ -1040,7 +776,7 @@ async def main():
             print("🛡️  IP黑名单: ⚠️ 状态检查失败")
             logging.debug(f"黑名单状态检查失败: {e}")
     else:
-        print("🛡️  IP黑名单: ⚠️ 功能不可用 (需要更新 country_proxy_manager.py)")
+        print("🛡️  IP黑名单: ⚠️ 功能不可用")
     
     print("="*70)
     
@@ -1055,9 +791,9 @@ async def main():
     print("="*70)
     print("💡 使用提示:")
     print("   1. 访问 Web 界面启动自动监控")
-    print("   2. 国家检测已修复，使用原版可靠方法")
-    print("   3. 黑名单功能已完美集成")
-    print("   4. 监控将在后台正常运行")
+    print("   2. 黑名单定时更新已修复，每5分钟检查一次")
+    print("   3. 强制更新功能已修复，Web界面按钮正常工作")
+    print("   4. 添加了详细调试信息，可通过 /api/blacklist/debug 查看")
     print("="*70)
     
     # 启动Flask应用（在单独线程中）
@@ -1103,275 +839,7 @@ if __name__ == '__main__':
     except Exception as e:
         logging.error(f"❌ 程序启动失败: {e}")
         import traceback
-        traceback.print_exc()#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-ProxyCat 最终版本 - 修复国家检测问题 + 集成黑名单功能
-"""
-
-import asyncio
-import socket
-import struct
-import threading
-import logging
-import os
-import sys
-import json
-import time
-import signal
-import importlib.util
-import subprocess
-from datetime import datetime
-from flask import Flask, request, jsonify, render_template_string
-from concurrent.futures import ThreadPoolExecutor
-
-# 添加当前目录到Python路径
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, current_dir)
-
-# 创建 Flask 应用
-app = Flask(__name__)
-
-# 全局变量
-current_proxy = None
-socks_server = None
-country_monitor = None
-main_loop = None  # 主事件循环
-executor = ThreadPoolExecutor(max_workers=4)  # 线程池
-
-proxy_stats = {
-    'current_proxy': None,
-    'current_country': None,
-    'total_checks': 0,
-    'proxy_switches': 0,
-    'country_changes': 0,
-    'blacklist_hits': 0,
-    'blacklist_size': 0,
-    'target_country': 'US',
-    'mode': 'country',
-    'language': 'cn',
-    'use_getip': True,
-    'port': 1080,
-    'web_port': 5000,
-    'connections_count': 0,
-    'bytes_transferred': 0
-}
-
-def load_simple_config():
-    """加载简化配置"""
-    config_path = os.path.join(current_dir, 'config', 'config.ini')
-    config = {
-        'mode': 'country',
-        'target_country': 'US',
-        'language': 'cn',
-        'use_getip': 'True',
-        'port': '1080',
-        'web_port': '5000',
-        'getip_url': '',
-        'buy_url_template': '',
-        'proxy_username': '',
-        'proxy_password': '',
-        'country_check_interval': '60',
-        'ip_blacklist_url': '',
-        'enable_ip_blacklist': 'True',
-        'blacklist_update_interval': '86400'
-    }
-    
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#') and '=' in line:
-                        key, value = line.split('=', 1)
-                        key = key.strip()
-                        value = value.strip()
-                        config[key] = value
-        except Exception as e:
-            logging.error(f"读取配置文件失败: {e}")
-    
-    return config
-
-def safe_import_getip():
-    """安全导入 getip 模块"""
-    try:
-        getip_path = os.path.join(current_dir, 'modules', 'getip.py')
-        if not os.path.exists(getip_path):
-            logging.error(f"getip.py 文件不存在: {getip_path}")
-            return None
-        
-        # 动态导入 modules.modules（如果存在）
-        modules_path = os.path.join(current_dir, 'modules', 'modules.py')
-        if os.path.exists(modules_path):
-            modules_spec = importlib.util.spec_from_file_location("modules", modules_path)
-            modules_module = importlib.util.module_from_spec(modules_spec)
-            sys.modules['modules.modules'] = modules_module
-            modules_spec.loader.exec_module(modules_module)
-        
-        # 动态导入 getip
-        spec = importlib.util.spec_from_file_location("getip", getip_path)
-        getip_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(getip_module)
-        
-        logging.info("✅ getip 模块加载成功")
-        return getip_module.newip
-        
-    except Exception as e:
-        logging.error(f"❌ getip 模块加载失败: {e}")
-        return None
-
-def run_in_executor(func, *args):
-    """在线程池中运行同步函数"""
-    return executor.submit(func, *args)
-
-def schedule_coroutine(coro):
-    """在主事件循环中调度协程"""
-    if main_loop and main_loop.is_running():
-        future = asyncio.run_coroutine_threadsafe(coro, main_loop)
-        return future
-    else:
-        logging.error("❌ 主事件循环不可用")
-        return None
-
-class CountryMonitor:
-    """自动国家检测和代理切换系统 - 修复版"""
-    
-    def __init__(self, target_country='US', check_interval=60, config=None):
-        self.target_country = target_country
-        self.check_interval = check_interval
-        self.is_monitoring = False
-        self.last_check_time = 0
-        self.last_country = None
-        self.consecutive_failures = 0
-        self.max_failures = 3
-        self.monitor_task = None
-        
-        # 黑名单功能支持
-        self.config = config or {}
-        self.enable_blacklist = self.config.get('enable_ip_blacklist', 'True').lower() == 'true'
-        self.blacklist_url = self.config.get('ip_blacklist_url', '')
-        
-        # 初始化黑名单管理器
-        if self.enable_blacklist and self.blacklist_url:
-            try:
-                from modules.country_proxy_manager import CountryBasedProxyManager
-                self.proxy_manager = CountryBasedProxyManager(config or {})
-                logging.info("✅ 黑名单管理器初始化成功")
-            except Exception as e:
-                logging.error(f"❌ 黑名单管理器初始化失败: {e}")
-                self.proxy_manager = None
-        else:
-            self.proxy_manager = None
-            if not self.enable_blacklist:
-                logging.info("🚫 IP黑名单功能已禁用")
-            elif not self.blacklist_url:
-                logging.warning("⚠️ 未配置黑名单URL，黑名单功能不可用")
-        
-    async def start_monitoring(self):
-        """启动自动监控"""
-        if self.is_monitoring:
-            logging.warning("⚠️ 国家监控已在运行中")
-            return
-            
-        self.is_monitoring = True
-        logging.info(f"🌍 启动自动国家监控 - 目标国家: {self.target_country}, 检测间隔: {self.check_interval}秒")
-        
-        # 创建监控任务
-        self.monitor_task = asyncio.create_task(self._monitoring_loop())
-        
-    async def _monitoring_loop(self):
-        """监控循环"""
-        while self.is_monitoring:
-            try:
-                await self.check_and_switch_if_needed()
-                await asyncio.sleep(self.check_interval)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logging.error(f"❌ 监控循环异常: {e}")
-                await asyncio.sleep(10)
-    
-    def stop_monitoring(self):
-        """停止监控"""
-        self.is_monitoring = False
-        if self.monitor_task:
-            self.monitor_task.cancel()
-        logging.info("🛑 自动国家监控已停止")
-    
-    async def check_and_switch_if_needed(self):
-        """检查当前代理国家，必要时切换"""
-        global current_proxy, proxy_stats
-        
-        if not current_proxy:
-            logging.info("🔄 当前无代理，尝试获取新代理...")
-            await self.switch_proxy("无代理")
-            return
-        
-        try:
-            # 使用原版的可靠检测方法（包含黑名单检查）
-            country = await self.detect_proxy_country(current_proxy)
-            
-            if country:
-                self.consecutive_failures = 0
-                proxy_stats['current_country'] = country
-                proxy_stats['total_checks'] += 1
-                self.last_check_time = time.time()
-                
-                if self.last_country != country:
-                    if self.last_country is not None:
-                        proxy_stats['country_changes'] += 1
-                        logging.info(f"🌍 检测到国家变化: {self.last_country} -> {country}")
-                    else:
-                        logging.info(f"🌍 首次检测到代理国家: {country}")
-                    
-                    self.last_country = country
-                
-                # 检查是否是黑名单IP
-                if country == 'BLACKLISTED':
-                    logging.warning("🚫 当前代理IP在黑名单中")
-                    proxy_stats['blacklist_hits'] += 1
-                    await self.switch_proxy("IP在黑名单中")
-                elif country != self.target_country:
-                    logging.warning(f"⚠️ 当前国家 {country} 不符合目标国家 {self.target_country}")
-                    await self.switch_proxy(f"国家不匹配 ({country} != {self.target_country})")
-                else:
-                    logging.info(f"✅ 代理国家检查通过: {country}")
-            
-            else:
-                self.consecutive_failures += 1
-                logging.error(f"❌ 代理国家检测失败 (连续失败 {self.consecutive_failures}/{self.max_failures})")
-                
-                if self.consecutive_failures >= self.max_failures:
-                    logging.error("❌ 连续检测失败次数过多，切换代理")
-                    await self.switch_proxy("连续检测失败")
-                    self.consecutive_failures = 0
-        
-        except Exception as e:
-            logging.error(f"❌ 国家检测过程异常: {e}")
-            self.consecutive_failures += 1
-    
-    async def detect_proxy_country(self, proxy_url):
-        """检测代理的真实出口国家（集成黑名单检查）"""
-        try:
-            proxy_for_curl = proxy_url
-            if proxy_for_curl.startswith('socks5://'):
-                proxy_for_curl = proxy_for_curl[9:]
-            
-            cmd = [
-                'curl', '-s', '--connect-timeout', '10', '--max-time', '15',
-                '-x', f'socks5://{proxy_for_curl}',
-                'https://ipinfo.io?token=2247bca03780c6'
-            ]
-            
-            # 在线程池中运行subprocess
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                executor, 
-                lambda: subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-            )
-            
-            if result.returncode == 0:
+        traceback.print_exc()
                 try:
                     data = json.loads(result.stdout)
                     country = data.get('country')
@@ -1696,7 +1164,7 @@ class SOCKS5Server:
             if '://' in proxy_url:
                 proxy_url = proxy_url.split('://', 1)[1]
             
-            if '@' in proxy_url:
+                        if '@' in proxy_url:
                 auth_part, addr_part = proxy_url.split('@', 1)
                 username, password = auth_part.split(':', 1)
                 host, port = addr_part.split(':', 1)
@@ -1832,3 +1300,695 @@ def init_country_monitor():
     # 传递完整配置给CountryMonitor，启用黑名单功能
     country_monitor = CountryMonitor(target_country, check_interval, config)
     return country_monitor
+
+# HTML 模板（增强版 - 包含黑名单功能）
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ProxyCat - 智能代理管理</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 15px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(45deg, #2c3e50, #3498db);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        .header h1 { font-size: 2.5em; margin-bottom: 10px; }
+        .status-banner {
+            background: #27ae60;
+            color: white;
+            padding: 15px;
+            text-align: center;
+            font-weight: bold;
+        }
+        .monitoring-status {
+            padding: 12px;
+            text-align: center;
+            font-weight: 500;
+            background: #3498db;
+            color: white;
+        }
+        .monitoring-status.active { background: #27ae60; }
+        .monitoring-status.inactive { background: #e74c3c; }
+        .main-content { padding: 30px; }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+        .stat-card {
+            background: white;
+            border-radius: 10px;
+            padding: 15px;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.08);
+            border-left: 4px solid #3498db;
+            text-align: center;
+            transition: transform 0.2s;
+        }
+        .stat-card:hover { transform: translateY(-2px); }
+        .stat-card.blacklist { border-left-color: #e74c3c; }
+        .stat-value {
+            font-size: 1.4em;
+            font-weight: bold;
+            margin-bottom: 5px;
+            color: #2c3e50;
+        }
+        .stat-label { color: #666; font-size: 0.85em; }
+        .control-panel {
+            background: white;
+            border-radius: 10px;
+            padding: 25px;
+            margin-bottom: 20px;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.08);
+        }
+        .control-panel h3 {
+            margin-bottom: 20px;
+            color: #2c3e50;
+            border-bottom: 2px solid #ecf0f1;
+            padding-bottom: 10px;
+        }
+        .btn {
+            background: #3498db;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 13px;
+            margin: 3px;
+            transition: all 0.3s;
+            font-weight: 500;
+        }
+        .btn:hover { background: #2980b9; transform: translateY(-1px); }
+        .btn.success { background: #27ae60; }
+        .btn.success:hover { background: #229954; }
+        .btn.warning { background: #f39c12; }
+        .btn.warning:hover { background: #e67e22; }
+        .btn.danger { background: #e74c3c; }
+        .btn.danger:hover { background: #c0392b; }
+        .btn:disabled { background: #95a5a6; cursor: not-allowed; transform: none; }
+        .input-field {
+            padding: 8px 12px;
+            border: 2px solid #ecf0f1;
+            border-radius: 6px;
+            font-size: 13px;
+            margin: 3px;
+            transition: border-color 0.3s;
+        }
+        .input-field:focus { border-color: #3498db; outline: none; }
+        .proxy-info {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            padding: 12px;
+            margin: 10px 0;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            word-break: break-all;
+        }
+        .monitor-info {
+            background: #e3f2fd;
+            border: 1px solid #90caf9;
+            border-radius: 8px;
+            padding: 12px;
+            margin: 10px 0;
+            font-size: 13px;
+            line-height: 1.4;
+        }
+        .blacklist-info {
+            background: #fff3e0;
+            border: 1px solid #ffb74d;
+            border-radius: 8px;
+            padding: 12px;
+            margin: 10px 0;
+            font-size: 13px;
+            line-height: 1.4;
+        }
+        .alert {
+            padding: 15px;
+            border-radius: 5px;
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 9999;
+            min-width: 300px;
+            animation: slideIn 0.3s ease;
+        }
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        .alert.success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .alert.error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .alert.warning { background: #fff3cd; color: #856404; border: 1px solid #ffeaa7; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🐱 ProxyCat</h1>
+            <p>智能代理池管理系统 - 自动国家监控版</p>
+        </div>
+        
+        <div class="status-banner">
+            🚀 SOCKS5 代理服务器运行中 - localhost:1080
+        </div>
+        
+        <div class="monitoring-status" id="monitoring-status">
+            🔍 监控状态检查中...
+        </div>
+        
+        <div class="main-content">
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-value" id="connections-count">0</div>
+                    <div class="stat-label">总连接数</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="proxy-switches">0</div>
+                    <div class="stat-label">代理切换</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="total-checks">0</div>
+                    <div class="stat-label">国家检测</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="country-changes">0</div>
+                    <div class="stat-label">国家变化</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="current-country">-</div>
+                    <div class="stat-label">当前国家</div>
+                </div>
+                <div class="stat-card blacklist">
+                    <div class="stat-value" id="blacklist-status">-</div>
+                    <div class="stat-label">黑名单状态</div>
+                </div>
+                <div class="stat-card blacklist">
+                    <div class="stat-value" id="blacklist-size">0</div>
+                    <div class="stat-label">黑名单大小</div>
+                </div>
+                <div class="stat-card blacklist">
+                    <div class="stat-value" id="blacklist-hits">0</div>
+                    <div class="stat-label">黑名单拦截</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="bytes-transferred">0 B</div>
+                    <div class="stat-label">数据传输</div>
+                </div>
+            </div>
+            
+            <div class="control-panel">
+                <h3>🤖 自动国家监控</h3>
+                
+                <div class="monitor-info" id="monitor-info">
+                    监控信息加载中...
+                </div>
+                
+                <div style="margin-bottom: 15px;">
+                    <label>目标国家:</label>
+                    <input type="text" id="target-country-input" class="input-field" value="US" maxlength="2" style="width: 80px;">
+                    <button class="btn" onclick="updateTargetCountry()">🎯 更新</button>
+                </div>
+                
+                <div>
+                    <button class="btn success" id="start-monitor-btn" onclick="startMonitoring()">▶️ 启动监控</button>
+                    <button class="btn danger" id="stop-monitor-btn" onclick="stopMonitoring()">⏹️ 停止监控</button>
+                    <button class="btn" onclick="checkMonitorStatus()">📋 检查状态</button>
+                </div>
+            </div>
+            
+            <div class="control-panel">
+                <h3>🛡️ 黑名单管理</h3>
+                
+                <div class="blacklist-info" id="blacklist-info">
+                    黑名单信息加载中...
+                </div>
+                
+                <div>
+                    <button class="btn" onclick="checkBlacklistStatus()">📋 检查状态</button>
+                    <button class="btn warning" onclick="forceUpdateBlacklist()">🔄 强制更新</button>
+                    <button class="btn" onclick="debugBlacklist()">🔍 调试信息</button>
+                </div>
+            </div>
+            
+            <div class="control-panel">
+                <h3>🎮 手动控制</h3>
+                
+                <div class="proxy-info">
+                    <strong>当前代理:</strong><br>
+                    <span id="current-proxy-display">未设置</span>
+                </div>
+                
+                <div>
+                    <button class="btn warning" onclick="manualSwitchProxy()">🔄 手动切换</button>
+                    <button class="btn" onclick="testProxy()">🧪 测试代理</button>
+                    <button class="btn" onclick="refreshStats()">📊 刷新统计</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div id="alert-container"></div>
+
+    <script>
+        let statsRefreshInterval;
+        
+        document.addEventListener('DOMContentLoaded', function() {
+            refreshStats();
+            checkMonitorStatus();
+            checkBlacklistStatus();
+            startAutoRefresh();
+        });
+        
+        function startAutoRefresh() {
+            statsRefreshInterval = setInterval(() => {
+                refreshStats();
+                checkMonitorStatus();
+            }, 3000);
+        }
+        
+        async function refreshStats() {
+            try {
+                const response = await fetch('/api/proxy/stats');
+                const data = await response.json();
+                
+                if (data.success) {
+                    updateStatsDisplay(data.data);
+                }
+            } catch (error) {
+                console.error('刷新统计失败:', error);
+            }
+        }
+        
+        async function checkMonitorStatus() {
+            try {
+                const response = await fetch('/api/monitor/status');
+                const data = await response.json();
+                
+                if (data.success) {
+                    updateMonitorStatus(data.data);
+                }
+            } catch (error) {
+                console.error('检查监控状态失败:', error);
+            }
+        }
+        
+        async function checkBlacklistStatus() {
+            try {
+                const response = await fetch('/api/blacklist/status');
+                const data = await response.json();
+                
+                if (data.success) {
+                    updateBlacklistInfo(data.data);
+                }
+            } catch (error) {
+                console.error('检查黑名单状态失败:', error);
+            }
+        }
+        
+        async function debugBlacklist() {
+            try {
+                const response = await fetch('/api/blacklist/debug');
+                const data = await response.json();
+                
+                if (data.success) {
+                    const debugInfo = JSON.stringify(data.data, null, 2);
+                    alert('黑名单调试信息:\\n' + debugInfo);
+                } else {
+                    showAlert('获取调试信息失败: ' + data.error, 'error');
+                }
+            } catch (error) {
+                showAlert('调试信息请求失败: ' + error.message, 'error');
+            }
+        }
+        
+        function updateStatsDisplay(stats) {
+            document.getElementById('connections-count').textContent = stats.connections_count || 0;
+            document.getElementById('proxy-switches').textContent = stats.proxy_switches || 0;
+            document.getElementById('total-checks').textContent = stats.total_checks || 0;
+            document.getElementById('country-changes').textContent = stats.country_changes || 0;
+            document.getElementById('current-country').textContent = stats.current_country || '-';
+            document.getElementById('blacklist-hits').textContent = stats.blacklist_hits || 0;
+            
+            const bytes = stats.bytes_transferred || 0;
+            let size = bytes < 1024 ? bytes + ' B' :
+                      bytes < 1024*1024 ? (bytes/1024).toFixed(1) + ' KB' :
+                      (bytes/1024/1024).toFixed(1) + ' MB';
+            document.getElementById('bytes-transferred').textContent = size;
+            
+            // 更新黑名单状态
+            const blacklistStatus = document.getElementById('blacklist-status');
+            const blacklistSize = document.getElementById('blacklist-size');
+            
+            if (stats.blacklist_enabled) {
+                if (stats.blacklist_loaded) {
+                    blacklistStatus.textContent = '✅ 已加载';
+                    blacklistStatus.style.color = '#27ae60';
+                } else {
+                    blacklistStatus.textContent = '❌ 失败';
+                    blacklistStatus.style.color = '#e74c3c';
+                }
+                blacklistSize.textContent = stats.blacklist_size || 0;
+            } else {
+                blacklistStatus.textContent = '🚫 禁用';
+                blacklistStatus.style.color = '#95a5a6';
+                blacklistSize.textContent = '0';
+            }
+            
+            // 更新代理显示
+            const proxyDisplay = document.getElementById('current-proxy-display');
+            if (stats.current_proxy) {
+                const displayProxy = stats.current_proxy.includes('@') ? 
+                    stats.current_proxy.split('@')[1] : stats.current_proxy;
+                proxyDisplay.textContent = displayProxy;
+                proxyDisplay.style.color = '#27ae60';
+            } else {
+                proxyDisplay.textContent = '未设置';
+                proxyDisplay.style.color = '#e74c3c';
+            }
+            
+            document.getElementById('target-country-input').value = stats.target_country || 'US';
+        }
+        
+        function updateMonitorStatus(monitorData) {
+            const statusEl = document.getElementById('monitoring-status');
+            const infoEl = document.getElementById('monitor-info');
+            const startBtn = document.getElementById('start-monitor-btn');
+            const stopBtn = document.getElementById('stop-monitor-btn');
+            
+            if (monitorData.is_monitoring) {
+                statusEl.textContent = '🤖 自动监控运行中';
+                statusEl.className = 'monitoring-status active';
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+            } else {
+                statusEl.textContent = '😴 自动监控已停止';
+                statusEl.className = 'monitoring-status inactive';
+                startBtn.disabled = false;
+                stopBtn.disabled = true;
+            }
+            
+            let infoHtml = `
+                <strong>目标国家:</strong> ${monitorData.target_country}<br>
+                <strong>检测间隔:</strong> ${monitorData.check_interval}秒<br>
+                <strong>上次检测:</strong> ${monitorData.last_check_time ? new Date(monitorData.last_check_time).toLocaleString() : '未检测'}<br>
+                <strong>连续失败:</strong> ${monitorData.consecutive_failures}次
+            `;
+            infoEl.innerHTML = infoHtml;
+        }
+        
+        function updateBlacklistInfo(blacklistData) {
+            const infoEl = document.getElementById('blacklist-info');
+            
+            if (!blacklistData.enabled) {
+                infoEl.innerHTML = '<strong>状态:</strong> 🚫 功能已禁用';
+                return;
+            }
+            
+            let statusText = blacklistData.loaded ? '✅ 已加载' : '❌ 未加载';
+            let sourceText = {
+                'local': '本地缓存',
+                'remote': '远程下载', 
+                'remote_sync': '远程同步',
+                'remote_async': '远程异步',
+                'empty': '空',
+                'disabled': '禁用',
+                'unknown': '未知'
+            }[blacklistData.source] || blacklistData.source;
+            
+            let updateText = blacklistData.needs_update ? '⏰ 需要更新' : '✅ 最新';
+            
+            let infoHtml = `
+                <strong>状态:</strong> ${statusText}<br>
+                <strong>大小:</strong> ${blacklistData.size} 条记录<br>
+                <strong>来源:</strong> ${sourceText}<br>
+                <strong>更新状态:</strong> ${updateText}<br>
+                <strong>上次更新:</strong> ${blacklistData.last_update ? 
+                    new Date(blacklistData.last_update).toLocaleString() : '从未更新'}<br>
+                <strong>缓存文件:</strong> ${blacklistData.cache_file_exists ? '✅ 存在' : '❌ 不存在'}<br>
+                <strong>更新间隔:</strong> ${blacklistData.update_interval_hours}小时
+            `;
+            
+            if (blacklistData.meta_info && blacklistData.meta_info.valid_count) {
+                infoHtml += `<br><strong>有效记录:</strong> ${blacklistData.meta_info.valid_count}`;
+                if (blacklistData.meta_info.invalid_count > 0) {
+                    infoHtml += ` (忽略 ${blacklistData.meta_info.invalid_count} 条无效记录)`;
+                }
+            }
+            
+            infoEl.innerHTML = infoHtml;
+        }
+        
+        async function startMonitoring() {
+            try {
+                showAlert('正在启动自动监控...', 'warning');
+                const response = await fetch('/api/monitor/start', { method: 'POST' });
+                const data = await response.json();
+                
+                if (data.success) {
+                    showAlert('自动监控已启动！', 'success');
+                    checkMonitorStatus();
+                } else {
+                    showAlert('启动失败: ' + data.message, 'error');
+                }
+            } catch (error) {
+                showAlert('启动失败: ' + error.message, 'error');
+            }
+        }
+        
+        async function stopMonitoring() {
+            try {
+                showAlert('正在停止自动监控...', 'warning');
+                const response = await fetch('/api/monitor/stop', { method: 'POST' });
+                const data = await response.json();
+                
+                if (data.success) {
+                    showAlert('自动监控已停止！', 'success');
+                    checkMonitorStatus();
+                } else {
+                    showAlert('停止失败: ' + data.message, 'error');
+                }
+            } catch (error) {
+                showAlert('停止失败: ' + error.message, 'error');
+            }
+        }
+        
+        async function manualSwitchProxy() {
+            try {
+                showAlert('正在切换代理...', 'warning');
+                const response = await fetch('/api/proxy/switch', { method: 'POST' });
+                const data = await response.json();
+                
+                if (data.success) {
+                    showAlert('代理切换成功！', 'success');
+                    refreshStats();
+                } else {
+                    showAlert('代理切换失败: ' + data.error, 'error');
+                }
+            } catch (error) {
+                showAlert('代理切换失败: ' + error.message, 'error');
+            }
+        }
+        
+        async function testProxy() {
+            try {
+                showAlert('正在测试代理...', 'warning');
+                const response = await fetch('/api/proxy/test', { method: 'POST' });
+                const data = await response.json();
+                
+                if (data.success) {
+                    showAlert(`代理测试成功！IP: ${data.ip}, 国家: ${data.country}`, 'success');
+                } else {
+                    showAlert('代理测试失败: ' + data.error, 'error');
+                }
+            } catch (error) {
+                showAlert('代理测试失败: ' + error.message, 'error');
+            }
+        }
+        
+        async function updateTargetCountry() {
+            const countryInput = document.getElementById('target-country-input');
+            const country = countryInput.value.trim().toUpperCase();
+            
+            if (country.length !== 2) {
+                showAlert('请输入2位国家代码', 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/proxy/country', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ country: country })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showAlert('目标国家更新成功！', 'success');
+                    refreshStats();
+                    checkMonitorStatus();
+                } else {
+                    showAlert('更新失败: ' + data.error, 'error');
+                }
+            } catch (error) {
+                showAlert('更新失败: ' + error.message, 'error');
+            }
+        }
+        
+        async function forceUpdateBlacklist() {
+            try {
+                showAlert('正在强制更新黑名单...', 'warning');
+                const response = await fetch('/api/blacklist/update', { method: 'POST' });
+                const data = await response.json();
+                
+                if (data.success) {
+                    showAlert('黑名单更新成功！', 'success');
+                    setTimeout(() => {
+                        checkBlacklistStatus();
+                        refreshStats();
+                    }, 2000);
+                } else {
+                    showAlert('更新失败: ' + data.error, 'error');
+                }
+            } catch (error) {
+                showAlert('更新失败: ' + error.message, 'error');
+            }
+        }
+        
+        function showAlert(message, type) {
+            const alertContainer = document.getElementById('alert-container');
+            const alertDiv = document.createElement('div');
+            alertDiv.className = `alert ${type}`;
+            alertDiv.textContent = message;
+            
+            alertContainer.appendChild(alertDiv);
+            
+            setTimeout(() => {
+                if (alertDiv.parentNode) {
+                    alertDiv.parentNode.removeChild(alertDiv);
+                }
+            }, 4000);
+        }
+    </script>
+</body>
+</html>
+'''
+
+# Flask 路由
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/proxy/stats')
+def get_proxy_stats():
+    """获取增强的统计信息"""
+    try:
+        stats = dict(proxy_stats)
+        
+        if country_monitor:
+            monitor_stats = country_monitor.get_stats()
+            stats.update(monitor_stats)
+        else:
+            stats.update({
+                'is_monitoring': False,
+                'last_check_time': None,
+                'consecutive_failures': 0
+            })
+        
+        return jsonify({
+            'success': True,
+            'data': stats
+        })
+    except Exception as e:
+        logging.error(f"❌ 获取统计信息失败: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/proxy/switch', methods=['POST'])
+def manual_switch():
+    global current_proxy, proxy_stats
+    
+    try:
+        newip_func = safe_import_getip()
+        if not newip_func:
+            return jsonify({
+                'success': False,
+                'error': 'getip 模块不可用，请检查配置'
+            }), 500
+        
+        logging.info("🔄 手动切换代理...")
+        new_proxy = newip_func()
+        
+        if new_proxy:
+            old_proxy = current_proxy
+            current_proxy = new_proxy
+            proxy_stats['current_proxy'] = new_proxy
+            proxy_stats['proxy_switches'] += 1
+            
+            logging.info(f"✅ 手动切换代理成功: {old_proxy} -> {new_proxy}")
+            return jsonify({
+                'success': True,
+                'message': '代理切换成功',
+                'old_proxy': old_proxy,
+                'new_proxy': new_proxy
+            })
+        else:
+            logging.error("❌ 获取新代理失败")
+            return jsonify({
+                'success': False,
+                'error': '无法获取新代理'
+            })
+            
+    except Exception as e:
+        logging.error(f"❌ 手动切换代理失败: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@app.route('/api/proxy/test', methods=['POST'])
+def test_proxy():
+    """测试当前代理"""
+    try:
+        if not current_proxy:
+            return jsonify({
+                'success': False,
+                'error': '当前没有设置代理'
+            })
+        
+        proxy_for_curl = current_proxy
+        if proxy_for_curl.startswith('socks5://'):
+            proxy_for_curl = proxy_for_curl[9:]
+        
+        cmd = [
+            'curl', '-s', '--connect-timeout', '10', '--max-time', '15',
+            '-x', f'socks5://{proxy_for_curl}',
+            'https://ipinfo.io?token=2247bca03780c6'
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        
+        if result.returncode == 0:
