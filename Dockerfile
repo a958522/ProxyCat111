@@ -16,8 +16,11 @@ COPY . .
 COPY cleanup_logs.py /app/cleanup_logs.py
 RUN chmod +x /app/cleanup_logs.py
 
-# 设置定时任务 - 每天凌晨2点执行清理
-RUN echo "0 2 * * * cd /app && python cleanup_logs.py >> /app/logs/cleanup.log 2>&1" | crontab -
+# 🔧 修复：使用 python3 而不是 python
+RUN echo "0 2 * * * cd /app && /usr/local/bin/python3 cleanup_logs.py >> /app/logs/cleanup.log 2>&1" | crontab -
+
+# 🔧 创建 python 软链接（备用方案）
+RUN ln -sf /usr/local/bin/python3 /usr/local/bin/python
 
 RUN rm -f config/config.ini
 
@@ -27,4 +30,4 @@ VOLUME ["/app/config", "/app/logs"]
 EXPOSE 1080 5000
 
 # 启动 cron 服务和主程序
-CMD service cron start && python app.py
+CMD service cron start && python3 app.py
