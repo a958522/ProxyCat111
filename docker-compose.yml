@@ -3,7 +3,7 @@ version: '3.8'
 services:
   proxycat:
     build: .
-    container_name: proxycat
+    container_name: proxy-1
     ports:
       - "1081:1080"  # SOCKS5代理端口
       - "5001:5000"  # Web管理界面端口
@@ -12,6 +12,11 @@ services:
       - ./logs:/app/logs
     environment:
       - TZ=Asia/Shanghai
+      - WEB_ACCESS_SUFFIX=/123
+      - SOCKS5_USERNAME=123
+      - SOCKS5_PASSWORD=123
+      - ENABLE_ACCESS_LOG=True
+  
     restart: unless-stopped
     networks:
       - proxycat_network
@@ -19,3 +24,6 @@ services:
 networks:
   proxycat_network:
     driver: bridge
+    
+#启动
+#docker-compose up -d --build
