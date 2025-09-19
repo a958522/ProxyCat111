@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-ProxyCat 最终版本 - 修复黑名单定时更新和强制更新问题
+ProxyCat
 """
 
 import asyncio
@@ -17,9 +17,12 @@ import time
 import signal
 import importlib.util
 import subprocess
+import base64
+import ipaddress
 from datetime import datetime
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, abort
 from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 
 # 添加当前目录到Python路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -54,8 +57,17 @@ proxy_stats = {
     'bytes_transferred': 0
 }
 
+# ===== 新增安全配置全局变量 =====
+security_config = {
+    'web_access_suffix': '/admin-panel-2024',
+    'socks5_username': 'proxyuser',
+    'socks5_password': 'proxy123456',
+    'web_allowed_ips': [],
+    'enable_access_log': True
+}
+
 def load_simple_config():
-    """加载简化配置"""
+    """加载简化配置（增强安全版）"""
     config_path = os.path.join(current_dir, 'config', 'config.ini')
     config = {
         'mode': 'country',
@@ -71,7 +83,13 @@ def load_simple_config():
         'country_check_interval': '60',
         'ip_blacklist_url': '',
         'enable_ip_blacklist': 'True',
-        'blacklist_update_interval': '86400'
+        'blacklist_update_interval': '86400',
+        # 新增安全配置
+        'web_access_suffix': '/admin-panel-2024',
+        'socks5_username': 'proxyuser',
+        'socks5_password': 'proxy123456',
+        'web_allowed_ips': '',
+        'enable_access_log': 'True'
     }
     
     if os.path.exists(config_path):
@@ -87,7 +105,92 @@ def load_simple_config():
         except Exception as e:
             logging.error(f"读取配置文件失败: {e}")
     
+    # 🔧 环境变量覆盖配置文件设置
+    config['web_access_suffix'] = os.getenv('WEB_ACCESS_SUFFIX', config['web_access_suffix'])
+    config['socks5_username'] = os.getenv('SOCKS5_USERNAME', config['socks5_username'])
+    config['socks5_password'] = os.getenv('SOCKS5_PASSWORD', config['socks5_password'])
+    config['web_allowed_ips'] = os.getenv('WEB_ALLOWED_IPS', config['web_allowed_ips'])
+    config['enable_access_log'] = os.getenv('ENABLE_ACCESS_LOG', config['enable_access_log'])
+    
     return config
+
+def init_security_config():
+    """初始化安全配置"""
+    global security_config
+    config = load_simple_config()
+    
+    security_config['web_access_suffix'] = config.get('web_access_suffix', '/admin-panel-2024')
+    security_config['socks5_username'] = config.get('socks5_username', 'proxyuser')
+    security_config['socks5_password'] = config.get('socks5_password', 'proxy123456')
+    security_config['enable_access_log'] = config.get('enable_access_log', 'True').lower() == 'true'
+    
+    # 解析允许的IP地址列表
+    allowed_ips_str = config.get('web_allowed_ips', '')
+    security_config['web_allowed_ips'] = []
+    
+    if allowed_ips_str.strip():
+        for ip_str in allowed_ips_str.split(','):
+            ip_str = ip_str.strip()
+            if ip_str:
+                try:
+                    # 支持单个IP和CIDR网段
+                    if '/' in ip_str:
+                        network = ipaddress.ip_network(ip_str, strict=False)
+                        security_config['web_allowed_ips'].append(network)
+                    else:
+                        ip = ipaddress.ip_address(ip_str)
+                        security_config['web_allowed_ips'].append(ip)
+                except ValueError:
+                    logging.warning(f"⚠️ 无效的IP地址格式: {ip_str}")
+    
+    # 确保访问后缀以 / 开头
+    if not security_config['web_access_suffix'].startswith('/'):
+        security_config['web_access_suffix'] = '/' + security_config['web_access_suffix']
+    
+    logging.info(f"🔒 Web管理面板访问路径: {security_config['web_access_suffix']}")
+    logging.info(f"🔐 SOCKS5认证: 用户名={security_config['socks5_username']}")
+    if security_config['web_allowed_ips']:
+        logging.info(f"🛡️ Web面板IP限制: {len(security_config['web_allowed_ips'])} 个允许的IP/网段")
+    else:
+        logging.info("🌐 Web面板无IP限制")
+
+def check_web_access_permission():
+    """检查Web访问权限"""
+    if not security_config['web_allowed_ips']:
+        return True  # 没有IP限制
+    
+    client_ip = request.environ.get('HTTP_X_FORWARDED_FOR', request.environ.get('REMOTE_ADDR', ''))
+    if ',' in client_ip:
+        client_ip = client_ip.split(',')[0].strip()
+    
+    try:
+        client_addr = ipaddress.ip_address(client_ip)
+        for allowed in security_config['web_allowed_ips']:
+            if isinstance(allowed, ipaddress.IPv4Network) or isinstance(allowed, ipaddress.IPv6Network):
+                if client_addr in allowed:
+                    return True
+            elif client_addr == allowed:
+                return True
+        
+        if security_config['enable_access_log']:
+            logging.warning(f"🚫 未授权的Web访问尝试: {client_ip}")
+        return False
+        
+    except ValueError:
+        if security_config['enable_access_log']:
+            logging.warning(f"🚫 无效的客户端IP地址: {client_ip}")
+        return False
+
+def require_web_access():
+    """Web访问权限装饰器"""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if not check_web_access_permission():
+                abort(403)  # Forbidden
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
 
 def safe_import_getip():
     """安全导入 getip 模块"""
@@ -455,13 +558,22 @@ class CountryMonitor:
             return None
 
 class SOCKS5Server:
-    """完整的 SOCKS5 代理服务器"""
+    """完整的 SOCKS5 代理服务器 - 增强安全版本（支持认证）"""
     
-    def __init__(self, host='0.0.0.0', port=1080):
+    def __init__(self, host='0.0.0.0', port=1080, username=None, password=None):
         self.host = host
         self.port = port
         self.running = False
         self.server = None
+        # 🔐 新增SOCKS5认证支持
+        self.username = username
+        self.password = password
+        self.auth_required = bool(username and password)
+        
+        if self.auth_required:
+            logging.info(f"🔐 SOCKS5服务器启用认证模式: 用户名={self.username}")
+        else:
+            logging.info("🔓 SOCKS5服务器使用无认证模式")
         
     async def start(self):
         """启动 SOCKS5 服务器"""
@@ -471,7 +583,8 @@ class SOCKS5Server:
                 self.handle_client, self.host, self.port
             )
             
-            logging.info(f"🚀 SOCKS5 服务器已启动: {self.host}:{self.port}")
+            auth_info = f" (认证: {self.username})" if self.auth_required else " (无认证)"
+            logging.info(f"🚀 SOCKS5 服务器已启动: {self.host}:{self.port}{auth_info}")
             
             async with self.server:
                 await self.server.serve_forever()
@@ -491,13 +604,25 @@ class SOCKS5Server:
     async def handle_client(self, reader, writer):
         """处理客户端连接"""
         client_addr = writer.get_extra_info('peername')
-        logging.info(f"📱 新客户端连接: {client_addr}")
+        
+        # 记录连接（如果启用访问日志）
+        if security_config['enable_access_log']:
+            logging.info(f"📱 新SOCKS5客户端连接: {client_addr}")
+        
         proxy_stats['connections_count'] += 1
         
         try:
-            if not await self.socks5_handshake(reader, writer):
+            # SOCKS5 握手
+            auth_method = await self.socks5_handshake(reader, writer)
+            if auth_method is None:
                 return
             
+            # 如果需要认证
+            if auth_method == 0x02:
+                if not await self.socks5_authenticate(reader, writer):
+                    return
+            
+            # 处理连接请求
             target_host, target_port = await self.socks5_connect_request(reader, writer)
             if not target_host:
                 return
@@ -505,14 +630,16 @@ class SOCKS5Server:
             await self.proxy_connection(target_host, target_port, reader, writer)
             
         except Exception as e:
-            logging.error(f"❌ 处理客户端连接失败 {client_addr}: {e}")
+            if security_config['enable_access_log']:
+                logging.error(f"❌ 处理SOCKS5客户端连接失败 {client_addr}: {e}")
         finally:
             try:
                 writer.close()
                 await writer.wait_closed()
             except:
                 pass
-            logging.debug(f"🔌 客户端连接关闭: {client_addr}")
+            if security_config['enable_access_log']:
+                logging.debug(f"🔌 SOCKS5客户端连接关闭: {client_addr}")
     
     async def socks5_handshake(self, reader, writer):
         """SOCKS5 握手"""
@@ -521,15 +648,70 @@ class SOCKS5Server:
             
             if len(data) < 3 or data[0] != 0x05:
                 logging.warning("❌ 无效的 SOCKS5 握手")
-                return False
+                return None
             
-            writer.write(b'\x05\x00')
-            await writer.drain()
+            num_methods = data[1]
+            methods = list(data[2:2+num_methods])
             
-            return True
+            # 🔐 根据服务器配置选择认证方法
+            if self.auth_required:
+                if 0x02 in methods:  # 用户名/密码认证
+                    writer.write(b'\x05\x02')
+                    await writer.drain()
+                    return 0x02
+                else:
+                    # 客户端不支持用户名密码认证
+                    writer.write(b'\x05\xFF')  # 无可接受的认证方法
+                    await writer.drain()
+                    return None
+            else:
+                if 0x00 in methods:  # 无需认证
+                    writer.write(b'\x05\x00')
+                    await writer.drain()
+                    return 0x00
+                else:
+                    writer.write(b'\x05\xFF')
+                    await writer.drain()
+                    return None
             
         except Exception as e:
             logging.error(f"❌ SOCKS5 握手失败: {e}")
+            return None
+    
+    async def socks5_authenticate(self, reader, writer):
+        """SOCKS5 用户名密码认证"""
+        try:
+            data = await asyncio.wait_for(reader.read(1024), timeout=10)
+            
+            if len(data) < 3 or data[0] != 0x01:
+                logging.warning("❌ 无效的 SOCKS5 认证请求")
+                writer.write(b'\x01\x01')  # 认证失败
+                await writer.drain()
+                return False
+            
+            username_len = data[1]
+            username = data[2:2+username_len].decode('utf-8')
+            password_len = data[2+username_len]
+            password = data[3+username_len:3+username_len+password_len].decode('utf-8')
+            
+            # 🔐 验证用户名密码
+            if username == self.username and password == self.password:
+                writer.write(b'\x01\x00')  # 认证成功
+                await writer.drain()
+                if security_config['enable_access_log']:
+                    logging.info(f"✅ SOCKS5认证成功: 用户={username}")
+                return True
+            else:
+                writer.write(b'\x01\x01')  # 认证失败
+                await writer.drain()
+                if security_config['enable_access_log']:
+                    logging.warning(f"🚫 SOCKS5认证失败: 用户={username}")
+                return False
+            
+        except Exception as e:
+            logging.error(f"❌ SOCKS5 认证失败: {e}")
+            writer.write(b'\x01\x01')
+            await writer.drain()
             return False
     
     async def socks5_connect_request(self, reader, writer):
@@ -562,11 +744,12 @@ class SOCKS5Server:
                 await writer.drain()
                 return None, None
             
-            logging.info(f"🎯 连接目标: {target_host}:{target_port}")
+            if security_config['enable_access_log']:
+                logging.info(f"🎯 SOCKS5连接目标: {target_host}:{target_port}")
             return target_host, target_port
             
         except Exception as e:
-            logging.error(f"❌ 解析连接请求失败: {e}")
+            logging.error(f"❌ 解析SOCKS5连接请求失败: {e}")
             return None, None
     
     async def proxy_connection(self, target_host, target_port, client_reader, client_writer):
@@ -606,7 +789,8 @@ class SOCKS5Server:
             client_writer.write(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
             await client_writer.drain()
             
-            logging.info(f"✅ 代理连接建立: {target_host}:{target_port}")
+            if security_config['enable_access_log']:
+                logging.info(f"✅ SOCKS5代理连接建立: {target_host}:{target_port}")
             
             await asyncio.gather(
                 self.pipe_data(client_reader, proxy_writer, "客户端->代理"),
@@ -615,7 +799,7 @@ class SOCKS5Server:
             )
             
         except Exception as e:
-            logging.error(f"❌ 代理连接失败: {e}")
+            logging.error(f"❌ SOCKS5代理连接失败: {e}")
             try:
                 client_writer.write(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
                 await client_writer.drain()
@@ -724,7 +908,7 @@ class SOCKS5Server:
                 proxy_stats['bytes_transferred'] += len(data)
                 
         except Exception as e:
-            logging.debug(f"🔄 数据转发结束 ({direction}): {e}")
+            logging.debug(f"🔄 SOCKS5数据转发结束 ({direction}): {e}")
         finally:
             try:
                 writer.close()
@@ -765,8 +949,9 @@ def init_country_monitor():
     country_monitor = CountryMonitor(target_country, check_interval, config)
     return country_monitor
 
-# HTML 模板（增强版 - 包含黑名单功能）
-HTML_TEMPLATE = '''
+
+ # HTML 模板（增强版 - 包含黑名单功能但隐藏安全设置）
+HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -907,6 +1092,16 @@ HTML_TEMPLATE = '''
             font-size: 13px;
             line-height: 1.4;
         }
+        .security-notice {
+            background: #e8f5e8;
+            border: 1px solid #4caf50;
+            border-radius: 8px;
+            padding: 12px;
+            margin: 10px 0;
+            font-size: 13px;
+            line-height: 1.4;
+            color: #2e7d32;
+        }
         .alert {
             padding: 15px;
             border-radius: 5px;
@@ -930,11 +1125,11 @@ HTML_TEMPLATE = '''
     <div class="container">
         <div class="header">
             <h1>🐱 ProxyCat</h1>
-            <p>智能代理池管理系统 - 自动国家监控版</p>
+            <p>智能代理池管理系统 - 增强安全版</p>
         </div>
         
         <div class="status-banner">
-            🚀 SOCKS5 代理服务器运行中 - localhost:1080
+            🚀 SOCKS5 代理服务器运行中 - localhost:1080 (已启用认证保护)
         </div>
         
         <div class="monitoring-status" id="monitoring-status">
@@ -942,6 +1137,10 @@ HTML_TEMPLATE = '''
         </div>
         
         <div class="main-content">
+            <div class="security-notice">
+                🔒 <strong>安全提示:</strong> 当前服务已启用增强安全功能，包括SOCKS5认证和Web面板访问控制。
+            </div>
+            
             <div class="stats-grid">
                 <div class="stat-card">
                     <div class="stat-value" id="connections-count">0</div>
@@ -1172,12 +1371,10 @@ HTML_TEMPLATE = '''
                 stopBtn.disabled = true;
             }
             
-            let infoHtml = `
-                <strong>目标国家:</strong> ${monitorData.target_country}<br>
-                <strong>检测间隔:</strong> ${monitorData.check_interval}秒<br>
-                <strong>上次检测:</strong> ${monitorData.last_check_time ? new Date(monitorData.last_check_time).toLocaleString() : '未检测'}<br>
-                <strong>连续失败:</strong> ${monitorData.consecutive_failures}次
-            `;
+            let infoHtml = "<strong>目标国家:</strong> " + monitorData.target_country + "<br>" +
+                          "<strong>检测间隔:</strong> " + monitorData.check_interval + "秒<br>" +
+                          "<strong>上次检测:</strong> " + (monitorData.last_check_time ? new Date(monitorData.last_check_time).toLocaleString() : '未检测') + "<br>" +
+                          "<strong>连续失败:</strong> " + monitorData.consecutive_failures + "次";
             infoEl.innerHTML = infoHtml;
         }
         
@@ -1202,21 +1399,19 @@ HTML_TEMPLATE = '''
             
             let updateText = blacklistData.needs_update ? '⏰ 需要更新' : '✅ 最新';
             
-            let infoHtml = `
-                <strong>状态:</strong> ${statusText}<br>
-                <strong>大小:</strong> ${blacklistData.size} 条记录<br>
-                <strong>来源:</strong> ${sourceText}<br>
-                <strong>更新状态:</strong> ${updateText}<br>
-                <strong>上次更新:</strong> ${blacklistData.last_update ? 
-                    new Date(blacklistData.last_update).toLocaleString() : '从未更新'}<br>
-                <strong>缓存文件:</strong> ${blacklistData.cache_file_exists ? '✅ 存在' : '❌ 不存在'}<br>
-                <strong>更新间隔:</strong> ${blacklistData.update_interval_hours}小时
-            `;
+            let infoHtml = "<strong>状态:</strong> " + statusText + "<br>" +
+                          "<strong>大小:</strong> " + blacklistData.size + " 条记录<br>" +
+                          "<strong>来源:</strong> " + sourceText + "<br>" +
+                          "<strong>更新状态:</strong> " + updateText + "<br>" +
+                          "<strong>上次更新:</strong> " + (blacklistData.last_update ? 
+                              new Date(blacklistData.last_update).toLocaleString() : '从未更新') + "<br>" +
+                          "<strong>缓存文件:</strong> " + (blacklistData.cache_file_exists ? '✅ 存在' : '❌ 不存在') + "<br>" +
+                          "<strong>更新间隔:</strong> " + blacklistData.update_interval_hours + "小时";
             
             if (blacklistData.meta_info && blacklistData.meta_info.valid_count) {
-                infoHtml += `<br><strong>有效记录:</strong> ${blacklistData.meta_info.valid_count}`;
+                infoHtml += "<br><strong>有效记录:</strong> " + blacklistData.meta_info.valid_count;
                 if (blacklistData.meta_info.invalid_count > 0) {
-                    infoHtml += ` (忽略 ${blacklistData.meta_info.invalid_count} 条无效记录)`;
+                    infoHtml += " (忽略 " + blacklistData.meta_info.invalid_count + " 条无效记录)";
                 }
             }
             
@@ -1281,7 +1476,7 @@ HTML_TEMPLATE = '''
                 const data = await response.json();
                 
                 if (data.success) {
-                    showAlert(`代理测试成功！IP: ${data.ip}, 国家: ${data.country}`, 'success');
+                    showAlert('代理测试成功！IP: ' + data.ip + ', 国家: ' + data.country, 'success');
                 } else {
                     showAlert('代理测试失败: ' + data.error, 'error');
                 }
@@ -1343,7 +1538,7 @@ HTML_TEMPLATE = '''
         function showAlert(message, type) {
             const alertContainer = document.getElementById('alert-container');
             const alertDiv = document.createElement('div');
-            alertDiv.className = `alert ${type}`;
+            alertDiv.className = 'alert ' + type;
             alertDiv.textContent = message;
             
             alertContainer.appendChild(alertDiv);
@@ -1357,14 +1552,35 @@ HTML_TEMPLATE = '''
     </script>
 </body>
 </html>
-'''
+"""
 
-# Flask 路由
+# ===== 增强安全的 Flask 路由 =====
+
+# 🔒 受保护的主页路由（需要正确的访问后缀）
 @app.route('/')
-def index():
+def index_redirect():
+    """根路径重定向或返回404"""
+    # 直接访问根路径返回404，增加安全性
+    abort(404)
+
+@app.route('/<path:suffix>')
+@require_web_access()
+def secure_index(suffix):
+    """安全的主页访问"""
+    # 检查访问后缀是否正确
+    if f'/{suffix}' != security_config['web_access_suffix']:
+        abort(404)
+    
+    # 记录访问日志
+    if security_config['enable_access_log']:
+        client_ip = request.environ.get('HTTP_X_FORWARDED_FOR', request.environ.get('REMOTE_ADDR', ''))
+        logging.info(f"🌐 Web管理面板访问: {client_ip}")
+    
     return render_template_string(HTML_TEMPLATE)
 
+# API路由保持不变，但加上访问权限检查
 @app.route('/api/proxy/stats')
+@require_web_access()
 def get_proxy_stats():
     """获取增强的统计信息"""
     try:
@@ -1392,6 +1608,7 @@ def get_proxy_stats():
         }), 500
 
 @app.route('/api/proxy/test', methods=['POST'])
+@require_web_access()
 def test_proxy():
     """测试当前代理"""
     try:
@@ -1454,6 +1671,7 @@ def test_proxy():
         }), 500
 
 @app.route('/api/proxy/country', methods=['GET', 'POST'])
+@require_web_access()
 def manage_target_country():
     global proxy_stats, country_monitor
     
@@ -1500,6 +1718,7 @@ def manage_target_country():
             }), 500
 
 @app.route('/api/monitor/start', methods=['POST'])
+@require_web_access()
 def start_country_monitoring():
     """启动自动国家监控"""
     global country_monitor, main_loop
@@ -1542,6 +1761,7 @@ def start_country_monitoring():
         }), 500
 
 @app.route('/api/monitor/stop', methods=['POST'])
+@require_web_access()
 def stop_country_monitoring():
     """停止自动国家监控"""
     global country_monitor
@@ -1567,6 +1787,7 @@ def stop_country_monitoring():
         }), 500
 
 @app.route('/api/monitor/status')
+@require_web_access()
 def get_monitor_status():
     """获取监控状态"""
     global country_monitor
@@ -1599,6 +1820,7 @@ def get_monitor_status():
         }), 500
 
 @app.route('/api/blacklist/status')
+@require_web_access()
 def get_blacklist_status():
     """获取黑名单详细状态"""
     try:
@@ -1627,8 +1849,9 @@ def get_blacklist_status():
         }), 500
 
 @app.route('/api/blacklist/update', methods=['POST'])
+@require_web_access()
 def force_update_blacklist():
-    """强制更新黑名单 - 最终修复版"""
+    """强制更新黑名单"""
     try:
         if not country_monitor or not hasattr(country_monitor, 'proxy_manager'):
             return jsonify({
@@ -1697,6 +1920,7 @@ def force_update_blacklist():
         }), 500
 
 @app.route('/api/blacklist/debug')
+@require_web_access()
 def debug_blacklist():
     """调试黑名单状态 - 详细信息"""
     try:
@@ -1778,22 +2002,70 @@ def debug_blacklist():
             'error': str(e)
         }), 500
 
+@app.route('/api/proxy/switch', methods=['POST'])
+@require_web_access()
+def manual_switch():
+    global current_proxy, proxy_stats
+    
+    try:
+        newip_func = safe_import_getip()
+        if not newip_func:
+            return jsonify({
+                'success': False,
+                'error': 'getip 模块不可用，请检查配置'
+            }), 500
+        
+        logging.info("🔄 手动切换代理...")
+        new_proxy = newip_func()
+        
+        if new_proxy:
+            old_proxy = current_proxy
+            current_proxy = new_proxy
+            proxy_stats['current_proxy'] = new_proxy
+            proxy_stats['proxy_switches'] += 1
+            
+            logging.info(f"✅ 手动切换代理成功: {old_proxy} -> {new_proxy}")
+            return jsonify({
+                'success': True,
+                'message': '代理切换成功',
+                'old_proxy': old_proxy,
+                'new_proxy': new_proxy
+            })
+        else:
+            logging.error("❌ 获取新代理失败")
+            return jsonify({
+                'success': False,
+                'error': '无法获取新代理'
+            })
+            
+    except Exception as e:
+        logging.error(f"❌ 手动切换代理失败: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
 def run_flask_app(port=5000):
     """运行Flask应用"""
     try:
         logging.info(f"🌐 启动 Web 管理界面: http://0.0.0.0:{port}")
+        logging.info(f"🔒 安全访问地址: http://localhost:{port}{security_config['web_access_suffix']}")
         app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
     except Exception as e:
         logging.error(f"❌ Flask应用启动失败: {e}")
 
 async def start_socks_server():
-    """启动 SOCKS5 服务器"""
+    """启动增强安全的 SOCKS5 服务器"""
     global socks_server
     try:
         config = load_simple_config()
         port = int(config.get('port', 1080))
         
-        socks_server = SOCKS5Server('0.0.0.0', port)
+        # 🔐 使用安全配置中的认证信息
+        username = security_config['socks5_username']
+        password = security_config['socks5_password']
+        
+        socks_server = SOCKS5Server('0.0.0.0', port, username, password)
         await socks_server.start()
     except Exception as e:
         logging.error(f"❌ SOCKS5 服务器启动失败: {e}")
@@ -1836,6 +2108,9 @@ async def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
+    # 🔐 初始化安全配置
+    init_security_config()
+    
     # 加载配置
     config = load_simple_config()
     proxy_stats.update({
@@ -1850,14 +2125,26 @@ async def main():
     # 初始化国家监控
     country_monitor = init_country_monitor()
     
-    # 打印启动信息
+    # 打印启动信息（增强安全版）
     print("\n" + "="*70)
-    print("🐱 ProxyCat - 智能代理池管理系统 (完全修复版)")
+    print("🐱 ProxyCat - 智能代理池管理系统 (增强安全版)")
     print("="*70)
-    print(f"🚀 SOCKS5 代理端口: {proxy_stats['port']}")
-    print(f"🌐 Web 管理界面: http://localhost:{proxy_stats['web_port']}")
+    print(f"🚀 SOCKS5 代理端口: {proxy_stats['port']} (用户名: {security_config['socks5_username']})")
+    print(f"🌐 Web 管理界面: http://localhost:{proxy_stats['web_port']}{security_config['web_access_suffix']}")
     print(f"🎯 目标国家: {proxy_stats['target_country']}")
     print(f"🤖 自动监控间隔: {country_monitor.check_interval}秒")
+    
+    # 显示安全功能状态
+    print("🔐 安全功能状态:")
+    print(f"   ✅ SOCKS5认证: 启用 (用户: {security_config['socks5_username']})")
+    print(f"   ✅ Web访问后缀: {security_config['web_access_suffix']}")
+    
+    if security_config['web_allowed_ips']:
+        print(f"   ✅ IP访问限制: 启用 ({len(security_config['web_allowed_ips'])} 个允许的IP/网段)")
+    else:
+        print("   ⚠️  IP访问限制: 禁用")
+    
+    print(f"   {'✅' if security_config['enable_access_log'] else '❌'} 访问日志: {'启用' if security_config['enable_access_log'] else '禁用'}")
     
     # 显示黑名单状态
     if country_monitor and hasattr(country_monitor, 'get_blacklist_stats'):
@@ -1901,10 +2188,11 @@ async def main():
     
     print("="*70)
     print("💡 使用提示:")
-    print("   1. 访问 Web 界面启动自动监控")
-    print("   2. 黑名单定时更新已修复，每5分钟检查一次")
-    print("   3. 强制更新功能已修复，Web界面按钮正常工作")
-    print("   4. 添加了详细调试信息，可通过 /api/blacklist/debug 查看")
+    print(f"   1. 访问 http://localhost:{proxy_stats['web_port']}{security_config['web_access_suffix']} 管理代理")
+    print(f"   2. SOCKS5代理: localhost:{proxy_stats['port']} (账号: {security_config['socks5_username']})")
+    print("   3. 黑名单定时更新已修复，每5分钟检查一次")
+    print("   4. 强制更新功能已修复，Web界面按钮正常工作")
+    print("   5. 增强安全功能已启用，包括访问控制和认证")
     print("="*70)
     
     # 启动Flask应用（在单独线程中）
@@ -1950,46 +2238,4 @@ if __name__ == '__main__':
     except Exception as e:
         logging.error(f"❌ 程序启动失败: {e}")
         import traceback
-        traceback.print_exc()
-
-@app.route('/api/proxy/switch', methods=['POST'])
-def manual_switch():
-    global current_proxy, proxy_stats
-    
-    try:
-        newip_func = safe_import_getip()
-        if not newip_func:
-            return jsonify({
-                'success': False,
-                'error': 'getip 模块不可用，请检查配置'
-            }), 500
-        
-        logging.info("🔄 手动切换代理...")
-        new_proxy = newip_func()
-        
-        if new_proxy:
-            old_proxy = current_proxy
-            current_proxy = new_proxy
-            proxy_stats['current_proxy'] = new_proxy
-            proxy_stats['proxy_switches'] += 1
-            
-            logging.info(f"✅ 手动切换代理成功: {old_proxy} -> {new_proxy}")
-            return jsonify({
-                'success': True,
-                'message': '代理切换成功',
-                'old_proxy': old_proxy,
-                'new_proxy': new_proxy
-            })
-        else:
-            logging.error("❌ 获取新代理失败")
-            return jsonify({
-                'success': False,
-                'error': '无法获取新代理'
-            })
-            
-    except Exception as e:
-        logging.error(f"❌ 手动切换代理失败: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }),
+        traceback.print_exc()       
