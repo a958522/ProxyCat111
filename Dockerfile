@@ -29,5 +29,17 @@ VOLUME ["/app/config", "/app/logs"]
 # 暴露端口
 EXPOSE 1080 5000
 
+
+
+
+
+# ===== 新增安全环境变量支持 =====
+# 这些环境变量会覆盖配置文件中的设置
+ENV WEB_ACCESS_SUFFIX="/123"
+ENV SOCKS5_USERNAME="123"
+ENV SOCKS5_PASSWORD="123"
+
+ENV ENABLE_ACCESS_LOG="True"
+
 # 启动 cron 服务和主程序
 CMD service cron start && python3 app.py
