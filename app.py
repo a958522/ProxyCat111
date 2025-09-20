@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-ProxyCat
+ProxyCat 增强安全版本 - 添加Web面板访问后缀和SOCKS5认证
 """
 
 import asyncio
@@ -396,7 +396,7 @@ class CountryMonitor:
             cmd = [
                 'curl', '-s', '--connect-timeout', '10', '--max-time', '15',
                 '-x', f'socks5://{proxy_for_curl}',
-                'https://ipinfo.io?token=2247bca03780c6'
+                'https://ipinfo.io?token=68cdce81ca2b21'
             ]
             
             # 在线程池中运行subprocess
@@ -1625,7 +1625,7 @@ def test_proxy():
         cmd = [
             'curl', '-s', '--connect-timeout', '10', '--max-time', '15',
             '-x', f'socks5://{proxy_for_curl}',
-            'https://ipinfo.io?token=2247bca03780c6'
+            'https://ipinfo.io?token=68cdce81ca2b21'
         ]
         
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
