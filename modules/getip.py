@@ -6,6 +6,7 @@ import time
 import random
 import requests
 import logging
+import os
 
 def load_config():
     """简化的配置加载函数"""
@@ -67,10 +68,48 @@ def newip():
         use_api_auth = config.get('use_api_auth', 'True').lower() == 'true'
         fallback_to_fixed = config.get('fallback_to_fixed', 'True').lower() == 'true'
         
-        # 🔥 过滤配置
-        filter_by_type = config.get('filter_by_type', 'True').lower() == 'true'
-        allowed_types = [t.strip() for t in config.get('allowed_proxy_types', 'residential,Residential').split(',')]
-        exclude_isps = [isp.strip().lower() for isp in config.get('exclude_isps', 'verizon,rcn').split(',')]
+        # 🔥 ISP过滤配置（使用手动解析确保正确读取）
+        
+        # 🔧 直接读取配置文件确保正确性
+        config_path = '/proxy-1/config/config.ini'
+        exclude_isps_config = 'verizon,rcn'  # 默认值
+        
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                
+                for line_num, line in enumerate(lines, 1):
+                    line_stripped = line.strip()
+                    if '=' in line_stripped and 'exclude_isps' in line_stripped:
+                        key, value = line_stripped.split('=', 1)
+                        if key.strip() == 'exclude_isps':
+                            exclude_isps_config = value.strip()
+                            print(f"🔧 直接读取exclude_isps (第{line_num}行): '{exclude_isps_config}'")
+                            break
+            except Exception as e:
+                print(f"🔧 直接读取失败，使用配置对象: {e}")
+                exclude_isps_config = config.get('exclude_isps', 'verizon,rcn')
+        else:
+            exclude_isps_config = config.get('exclude_isps', 'verizon,rcn')
+        
+        # 🔧 支持环境变量覆盖（优先级最高）
+        env_exclude_isps = os.getenv('EXCLUDE_ISPS')
+        if env_exclude_isps:
+            exclude_isps_config = env_exclude_isps
+            print(f"🔧 使用环境变量EXCLUDE_ISPS: '{exclude_isps_config}'")
+        
+        # 处理空配置的情况
+        if exclude_isps_config.strip():
+            exclude_isps = [isp.strip().lower() for isp in exclude_isps_config.split(',') if isp.strip()]
+        else:
+            exclude_isps = []
+        
+        # 显示当前的ISP过滤配置
+        if exclude_isps:
+            print(f"🔧 当前ISP过滤配置: {exclude_isps}")
+        else:
+            print(f"🔧 ISP过滤已禁用（exclude_isps为空）")
         
         if not list_url:
             raise ValueError('getip_url 配置为空，请在 config.ini 中设置 getip_url')
@@ -95,15 +134,14 @@ def newip():
                 if not proxy_list:
                     raise ValueError("代理列表为空")
                 
-                # 🔥 智能过滤系统：ISP + 代理类型
+                # 🔥 简化的过滤系统：只过滤ISP
                 filtered_proxy_list = []
                 total_count = len(proxy_list)
                 excluded_by_isp = 0
-                excluded_by_type = 0
                 
                 for proxy in proxy_list:
                     host = proxy.get('host', '').lower()
-                    proxy_type = proxy.get('is_type', '')
+                    proxy_id = proxy.get('id', 'unknown')
                     
                     # 检查ISP排除列表
                     excluded_by_current_isp = False
@@ -117,32 +155,23 @@ def newip():
                     if excluded_by_current_isp:
                         continue
                     
-                    # 🔥 检查代理类型（如果启用类型过滤）
-                    if filter_by_type and allowed_types:
-                        if proxy_type not in allowed_types:
-                            excluded_by_type += 1
-                            continue
-                    
                     filtered_proxy_list.append(proxy)
                 
-                # 详细的过滤统计信息
+                # 简化的过滤统计信息
                 print(f"📊 代理筛选统计:")
                 print(f"   总代理数量: {total_count}")
                 print(f"   ISP过滤排除: {excluded_by_isp} 个")
-                print(f"   类型过滤排除: {excluded_by_type} 个")
                 print(f"   符合条件的代理: {len(filtered_proxy_list)} 个")
                 
-                if filter_by_type:
-                    print(f"   允许的类型: {', '.join(allowed_types)}")
                 if exclude_isps:
-                    print(f"   排除的ISP: {', '.join(exclude_isps)}")
+                    print(f"   排除的ISP关键字: {', '.join(exclude_isps)}")
                 
                 if not filtered_proxy_list:
                     error_msg = "过滤后的代理列表为空。"
-                    if filter_by_type:
-                        error_msg += f" 没有找到类型为 {allowed_types} 的代理。"
                     if exclude_isps:
-                        error_msg += f" 或所有代理都包含被排除的ISP: {exclude_isps}。"
+                        error_msg += f" 所有代理都包含被排除的ISP关键字: {exclude_isps}。"
+                    else:
+                        error_msg += " 原始代理列表为空。"
                     raise ValueError(error_msg)
                 
                 # 从过滤后的列表中随机选择一个代理的ID
@@ -220,7 +249,12 @@ def newip():
                 print(f"  - 端口: {port}")
                 print(f"  - 位置: {proxy_data.get('city', 'Unknown')}, {proxy_data.get('region', 'Unknown')}")
                 print(f"  - ISP: {proxy_data.get('host', 'Unknown')}")
-                print(f"  - 类型: {proxy_data.get('is_type', 'Unknown')}")
+                
+                # 只有当API确实返回了类型信息时才显示
+                proxy_type = proxy_data.get('is_type', '')
+                if proxy_type and proxy_type != 'Unknown':
+                    print(f"  - 类型: {proxy_type}")
+                
                 print(f"  - 认证: {auth_source}")
                 
                 # 构造代理字符串
@@ -274,8 +308,103 @@ def newip():
     except Exception as e:
         handle_error('unknown', e)
 
+def debug_config():
+    """调试配置加载情况"""
+    print("🔧 调试配置加载情况:")
+    print("="*50)
+    
+    import os
+    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'config.ini')
+    print(f"配置文件路径: {config_path}")
+    print(f"配置文件是否存在: {os.path.exists(config_path)}")
+    
+    if os.path.exists(config_path):
+        print(f"\n配置文件内容:")
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+                for i, line in enumerate(lines, 1):
+                    if 'exclude_isps' in line.lower():
+                        print(f"  第{i}行: {line.strip()} ⭐")
+                    elif line.strip() and not line.strip().startswith('#'):
+                        print(f"  第{i}行: {line.strip()}")
+        except Exception as e:
+            print(f"读取配置文件失败: {e}")
+    
+    # 🔧 使用修复后的配置加载逻辑
+    config = load_config()
+    
+    print(f"\n解析后的配置:")
+    for key, value in config.items():
+        if 'password' in key.lower():
+            print(f"  {key} = {'*' * len(str(value)) if value else '(空)'}")
+        else:
+            print(f"  {key} = {value}")
+    
+    print("\n🔧 ISP过滤解析结果:")
+    exclude_isps_config = config.get('exclude_isps', 'verizon,rcn')
+    print(f"  最终配置值: '{exclude_isps_config}'")
+    
+    if exclude_isps_config.strip():
+        exclude_isps = [isp.strip().lower() for isp in exclude_isps_config.split(',') if isp.strip()]
+        print(f"  解析后的ISP列表: {exclude_isps}")
+        print(f"  ISP过滤状态: 启用")
+    else:
+        print(f"  解析后的ISP列表: []")
+        print(f"  ISP过滤状态: 禁用")
+    
+    print("="*50)
+
+def test_isp_filtering():
+    """测试ISP过滤功能"""
+    print("🧪 测试ISP过滤功能:")
+    print("="*50)
+    
+    # 模拟一些代理数据
+    test_proxies = [
+        {"id": "1", "host": "Verizon Communications Inc.", "ipaddress": "1.1.1.1"},
+        {"id": "2", "host": "T-Mobile USA, Inc.", "ipaddress": "2.2.2.2"},
+        {"id": "3", "host": "Cox Communications", "ipaddress": "3.3.3.3"},
+        {"id": "4", "host": "AT&T Services Inc.", "ipaddress": "4.4.4.4"},
+        {"id": "5", "host": "Spectrum Internet Services", "ipaddress": "5.5.5.5"},
+    ]
+    
+    config = load_config()
+    exclude_isps_config = config.get('exclude_isps', 'verizon,rcn')
+    
+    if exclude_isps_config.strip():
+        exclude_isps = [isp.strip().lower() for isp in exclude_isps_config.split(',') if isp.strip()]
+    else:
+        exclude_isps = []
+    
+    print(f"当前排除的ISP: {exclude_isps}")
+    print("\n代理过滤测试:")
+    
+    for proxy in test_proxies:
+        host = proxy.get('host', '').lower()
+        proxy_id = proxy.get('id')
+        
+        excluded = False
+        matched_isp = None
+        
+        if exclude_isps:
+            for excluded_isp in exclude_isps:
+                if excluded_isp and excluded_isp in host:
+                    excluded = True
+                    matched_isp = excluded_isp
+                    break
+        
+        status = "❌ 被排除" if excluded else "✅ 通过"
+        reason = f" (匹配: '{matched_isp}')" if matched_isp else ""
+        
+        print(f"  代理{proxy_id}: {proxy['host']} -> {status}{reason}")
+    
+    print("="*50)
 def test_proxy_format():
     """测试不同的代理格式"""
+    print("🧪 测试代理格式解析:")
+    print("="*50)
+    
     # 模拟API响应测试
     test_data_with_auth = {
         "status": {"code": "1000", "message": "Success"},
@@ -301,8 +430,7 @@ def test_proxy_format():
         }
     }
     
-    print("🧪 测试代理格式解析:")
-    print("\n1. 带认证信息的代理:")
+    print("1. 带认证信息的代理:")
     proxy_data = test_data_with_auth['data']
     username = proxy_data.get('username', '').strip()
     password = proxy_data.get('password', '').strip()
@@ -329,11 +457,41 @@ def test_proxy_format():
     else:
         result = f"socks5://{ip}:{port}"
         print(f"   结果: {result}")
+    
+    print("="*50)
 
 # 测试函数
 if __name__ == "__main__":
     print("🔧 ProxyCat - 代理获取模块测试")
-    print("="*50)
+    print("="*70)
+    
+    import sys
+    
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "debug":
+            debug_config()
+            exit()
+        elif sys.argv[1] == "test-isp":
+            test_isp_filtering()
+            exit()
+        elif sys.argv[1] == "test-format":
+            test_proxy_format()
+            exit()
+    
+    print("可用的测试命令:")
+    print("  python3 getip.py debug       - 调试配置加载")
+    print("  python3 getip.py test-isp    - 测试ISP过滤")
+    print("  python3 getip.py test-format - 测试代理格式")
+    print("  python3 getip.py             - 实际获取代理")
+    print()
+    
+    # 先调试配置
+    debug_config()
+    print()
+    
+    # 测试ISP过滤
+    test_isp_filtering()
+    print()
     
     # 先测试格式解析
     test_proxy_format()
