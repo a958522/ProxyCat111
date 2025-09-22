@@ -19,7 +19,7 @@ class CountryBasedProxyManager:
         self.language = config.get('language', 'cn')
         self.target_country = config.get('target_country', 'US')
         self.check_interval = int(config.get('country_check_interval', 60))
-        self.max_retries = int(config.get('max_retries', 3))
+        self.max_retries = int(config.get('max_retries', 2))
         self.timeout = int(config.get('request_timeout', 10))
         
         # 黑名单相关配置
