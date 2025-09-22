@@ -449,7 +449,7 @@ class CountryMonitor:
                 logging.error("❌ getip 模块不可用，无法切换代理")
                 return False
             
-            max_attempts = 5
+            max_attempts = 2
             for attempt in range(max_attempts):
                 try:
                     # 在线程池中获取新代理
